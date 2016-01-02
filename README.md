@@ -1,0 +1,2 @@
+# vcStorage
+vm,Cloud,storage
