@@ -1,0 +1,4035 @@
+#!/usr/bin/env python
+
+import os
+import re
+import sys
+import commands
+import optparse
+import pickle
+import time
+import json
+import subprocess
+import glob
+import random
+from subprocess import Popen, PIPE
+from socket import inet_ntoa
+from struct import pack
+import ConfigParser
+import fcntl
+import signal
+import datetime
+
+ZADARA_DIR		= '/var/lib/zadara'
+INSTALL_DIR		= os.path.join(ZADARA_DIR, 'install')
+INSTALL_SCRIPTS_DIR	= os.path.join(INSTALL_DIR, "scripts")
+ZPKGS_DIR_LOCAL		= os.path.join(INSTALL_DIR, "pkgs")
+ZPKGS_STAGING_DIR	= os.path.join(INSTALL_DIR, "pkg_staging")
+ZPKGS_DIR_DRBD		= os.path.join('/mnt/nova/', "pkgs")
+CCVM_INI_FILE		= '/mnt/nova/ccvm/ccvm.ini'
+ZINSTALL		= os.path.join('/usr/bin/', "zinstall")
+CHECKPOINT_FILE		= os.path.join(INSTALL_DIR, '.checkpoint')
+ZADARA_INSTALL_SH	= os.path.join(INSTALL_SCRIPTS_DIR, "_zadara_install.sh")
+DEFAULT_S3CFG		= os.path.join(INSTALL_DIR, ".s3cfg")
+VPSA_REQUESTS_PY	= os.path.join(ZADARA_DIR, "scripts", "sn", "vpsa-requests.py")
+COMMON_SCRIPTS_DIR	= os.path.join(ZADARA_DIR, "scripts", "common")
+DRBD_SETTINGS_FILE	= os.path.join(INSTALL_DIR, 'settings/drbd.settings')
+ZADARA_S3_PUBLIC_REPO	= 's3://zadarastorage-install/'
+EUCA_CREDENTIALS	= '/root/__creds/novarc'
+CC_FAILOVER_MARKER	= '/mnt/nova/.failover'
+INSTALL_CONFIG_FILE	= '.install_config'
+ZADARA_APT_PROXY_DIR	= '/etc/apt/apt.conf.d/'
+ZADARA_APT_PROXY_FILE	= os.path.join(ZADARA_APT_PROXY_DIR, '98proxy')
+ONE_GB			= (1024*1024*1024)
+DRBD_MIN_PART_SIZE	= (85*ONE_GB)
+sys.path.append(os.getcwd())
+sys.path.append(INSTALL_SCRIPTS_DIR)
+
+from zinstall_logging import log
+from zinstall_logging import log_get_last_error
+from zinstall_logging import log_exception_stack
+
+from zinstall_logging import LOG_LEVEL_INFO
+from zinstall_logging import LOG_LEVEL_WARN
+from zinstall_logging import LOG_LEVEL_ERROR
+
+import zinstall_logging
+
+CHECKPOINT_EMPTY			= 0
+CHECKPOINT_INTF_RENAMED			= 1
+CHECKPOINT_SRIOV_INSTALL		= 2
+CHECKPOINT_NETWORK_INSTALL		= 3
+CHECKPOINT_INSTALL_COMPLETE		= 4
+CHECKPOINT_CCMASTER_REPO_SWITCH		= 5
+CHECKPOINT_CCMASTER_REGISTER_IMGS	= 6
+CHECKPOINT_CCMASTER_SETUP_CCVM		= 7
+CHECKPOINT_SN_INSTALL_COMPLETE		= 8
+CHECKPOINT_SN_UPGRADE_REGISTER_IMGS	= 9
+CHECKPOINT_SN_UPGRADE_COMPLETE		= 10
+CHECKPOINT_FMT_STRING			= "%d_%s_%s" # checkpoint_install/upgrade_component
+checkpoint_str = { CHECKPOINT_EMPTY : 'empty', CHECKPOINT_INTF_RENAMED : 'intfs_renamed', CHECKPOINT_SRIOV_INSTALL : 'sriov_install',
+				CHECKPOINT_NETWORK_INSTALL : 'network_install', CHECKPOINT_INSTALL_COMPLETE : 'install_complete',
+				CHECKPOINT_CCMASTER_REPO_SWITCH : 'ccmaster_repo_switch', CHECKPOINT_CCMASTER_REGISTER_IMGS : 'ccmaster_register_imgs',
+				CHECKPOINT_CCMASTER_SETUP_CCVM : 'setup_ccvm', CHECKPOINT_SN_INSTALL_COMPLETE : 'sn_install_complete',
+				CHECKPOINT_SN_UPGRADE_REGISTER_IMGS : 'upgrade_register_imgs', CHECKPOINT_SN_UPGRADE_COMPLETE : 'upgrade_complete'}
+
+supported_installer_config = ['proxy_host', 'proxy_port']
+
+# List of actions that we support
+EXT_REQ_LIST_SNS		= 'list_sns'
+EXT_REQ_LIST_PKGS		= 'list_pkgs'
+EXT_REQ_DOWNLOAD_PKG		= 'download_pkg'
+EXT_REQ_ERASE_PKG		= 'erase_pkg'
+EXT_REQ_CC_INSTALL		= 'cc_install'
+EXT_REQ_SN_INSTALL		= 'sn_install'
+EXT_REQ_SN_UPGRADE		= 'sn_upgrade'
+EXT_REQ_CHECK_NETWORKING	= 'check_networking'
+EXT_REQ_CLOUD_INSTALL_PKG	= 'cloud_install_pkg'
+EXT_REQ_CLOUD_UPGRADE		= 'cloud_upgrade'
+EXT_REQ_REGISTER_IMGS_IN_GLANCE	= 'register_image'
+EXT_REQ_SHOW_CONFIG		= 'show_config'
+EXT_REQ_SET_CONFIG		= 'set_config'
+VALID_USER_ACTIONS		= [EXT_REQ_LIST_SNS, EXT_REQ_LIST_PKGS, EXT_REQ_DOWNLOAD_PKG, EXT_REQ_CC_INSTALL, EXT_REQ_SN_INSTALL, EXT_REQ_SN_UPGRADE, EXT_REQ_CHECK_NETWORKING, EXT_REQ_CLOUD_INSTALL_PKG, EXT_REQ_CLOUD_UPGRADE, EXT_REQ_REGISTER_IMGS_IN_GLANCE, EXT_REQ_SHOW_CONFIG, EXT_REQ_SET_CONFIG]
+
+INT_REQ_DUMP_NODE_NETWORK_INFO	= 'dump_node_network_info'
+INT_REQ_ASSIGN_IP_ON_INTF	= 'assign_ip_on_intf'
+INT_REQ_UNASSIGN_IP_ON_INTF	= 'unassign_ip_on_intf'
+INT_REQ_PING_IP_ON_INTF		= 'ping_ip_on_intf'
+INT_REQ_RENAME_NETWORK_INTF	= 'rename_network_intf'
+INT_REQ_GET_PACKAGE_DETAILS	= 'get_package_details'
+INT_REQ_DOWNLOAD_PKG		= 'int_download_pkg'
+INT_REQ_ERASE_PKG		= 'int_erase_pkg'
+INT_REQ_STAGE_PKG_FOR_INSTALL	= 'int_stage_pkg_for_install'
+INT_REQ_DESTAGE_PKG_AFTER_INSTALL	= 'int_destage_pkg_after_install'
+INT_REQ_LOAD_CHECKPOINT		= 'int_load_checkpoint'
+INT_REQ_UPDATE_CHECKPOINT	= 'int_update_checkpoint'
+INT_REQ_SWITCHOVER_REPO_DIR	= 'int_switchover_repo'
+INT_REQ_REGISTER_IMGS_IN_GLANCE	= 'int_register_imgs_in_glance'
+INT_REQ_SETUP_CCVM		= 'int_setup_ccvm'
+INT_REQ_GET_DRBD_STATE		= 'int_get_drbd_state'
+INT_REQ_INSTALL_REMOTE_PKGS	= 'int_install_remote_pkgs'
+INT_REQ_TRIGGER_CC_FAILOVER	= 'int_trigger_cc_failover'
+INT_REQ_CONTINUE_CC_FAILOVER	= 'int_continue_cc_failover'
+INT_REQ_GET_CONFIG		= 'int_get_config'
+INT_REQ_ENSURE_VLAN_PKG		= 'int_ensure_vlan_pkg'
+INT_REQ_CREATE_SUPPORT_TICKET	= 'int_create_support_ticket'
+INT_REQ_DUMP_DRBD_PART_INFO	= 'int_dump_drbd_part_info'
+INT_REQ_CREATE_DRBD_SETTINGS	= 'int_create_drbd_settings'
+INT_REQ_SET_CONFIG		= 'int_set_config'
+INT_REQ_ENSURE_APT_SETUP_FOR_PROXY	= 'int_ensure_apt_setup_for_proxy'
+
+UDEV_NET_PERSISTENT_RULES	= '/etc/udev/rules.d/70-persistent-net.rules'
+ETC_NETWORK_INTERFACES		= '/etc/network/interfaces'
+ETC_HOSTS			= '/etc/hosts'
+
+
+# installer-phase
+installer_phase=0
+
+in_critical_section	= False
+should_abort		= False
+abort_notifier		= None
+
+cached_vsa_drive_host_mapping	= {}
+
+def abort_execution(abort_notify_fn):
+	global should_abort
+	global abort_notifier
+	global in_critical_section
+
+	should_abort = True
+	abort_notifier = abort_notify_fn
+	if in_critical_section:
+		log(LOG_LEVEL_INFO, 'In Critical section. Queing abort after critical section completion')
+		return -1
+
+	if abort_notifier:
+		abort_notifier()
+	log(LOG_LEVEL_INFO, 'Exitting')
+	sys.exit(0)
+
+def execute_cmd_by_subprocess(cmd, timeout=0, kill_on_timeout=True, raise_on_timeout=False, log_execution=True, print_stdout=False):
+	try:
+		p = Popen(cmd, bufsize=0, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	except OSError as e:
+		return -1, None, None
+
+	fin_time = time.time() + timeout
+	while p.poll() == None:
+		if timeout > 0 and time.time() > fin_time:
+			if kill_on_timeout:
+				try: # for the case it just terminated
+					p.kill()
+				except Exception:
+					pass
+            		log(LOG_LEVEL_ERROR, 'local_execute:%s (Timeout after %s)' % (cmd, timeout))
+			if raise_on_timeout:
+				raise basicUtils.TimeoutException
+			return 1, '', 'Timeout after %s' % timeout
+		if print_stdout:
+			try:
+				line = p.stdout.readline()
+			except:
+				line = None
+			if line and 'sudo: unable to resolve host' not in line:
+				sys.stdout.write(line)
+			continue
+		time.sleep(0.05)
+	stdout, stderr = p.communicate()
+	rc = p.returncode
+
+	# kick out sudo errors if any
+	if rc == 0 and 'sudo: unable to resolve host' in stdout:
+		stdout = '\n'.join(x for x in stdout.split('\n')[1:])
+
+	if print_stdout:
+		sys.stdout.write(stdout)
+
+	if log_execution:
+		if rc == 0:
+			log(LOG_LEVEL_INFO, 'local_execute:%s (success)' % (cmd))
+		else:
+			log(LOG_LEVEL_ERROR, 'local_execute:%s (rc:%d, stdout:%s, stderr:%s)' % (cmd, rc, stdout, stderr))
+	
+	return rc, stdout, stderr
+
+def local_execute_cmd(cmd, print_mask = 1):
+	if (print_mask & 1) == 1 :
+		log(LOG_LEVEL_INFO, 'Performing local cmd: {}'.format(cmd))
+	rc, msg = commands.getstatusoutput(cmd)
+	if (print_mask & 2) == 2 :
+		log(LOG_LEVEL_INFO, 'local cmd: {} returned {} {}'.format(cmd, rc, msg))
+	return rc, msg
+# TODO - END
+
+def atoi(text):
+	return int(text) if text.isdigit() else text
+
+def natural_keys(text):
+	return [ atoi(c) for c in re.split('(\d+)', text) ]
+
+def _zinstall_assert(predicate, msg, _level):
+	if not predicate:
+		log(LOG_LEVEL_ERROR, msg)
+		print 'ERROR: %s' % msg
+
+def get_net_details_for_intf(intf):
+	# get mac-address
+	mac=None
+	rc, msg = local_execute_cmd('ip link show dev %s' % intf)
+	for line in msg.split("\n"):
+		if 'ether' in line:
+			mac=line.split()[1]
+
+	# get PCI device location
+	rc, msg = local_execute_cmd('find /sys/devices -name %s' % intf)
+	pci_dev=msg.strip().split('/net')[0]
+
+	driver=os.readlink('/sys/class/net/%s/device/driver' % intf).split("/")[-1]
+	with open ("%s/vendor" % pci_dev, "r") as vendor_file:
+		vendor=vendor_file.read().strip()
+
+	# Some multi-port network cards use the same PCI address for all their ports,
+	# but a different dev_id, so fetch it as well
+	dev_id=None
+	with open ("/sys/class/net/%s/dev_id" % intf, "r") as dev_id_file:
+		dev_id=dev_id_file.read().strip()
+	return mac, pci_dev, driver, vendor, dev_id
+
+def cidr_to_netmask(cidr):
+	bits = 0xffffffff ^ (1 << 32 - cidr) - 1
+	return inet_ntoa(pack('>I', bits))
+
+def get_s3cfg_file():
+	tmpl_path=os.path.join(INSTALL_DIR, "settings/tmpl")
+	if os.path.exists(tmpl_path):
+		for f in os.listdir(tmpl_path):
+			if 's3cfg' in f:
+				return os.path.join(tmpl_path, f)
+	return DEFAULT_S3CFG
+
+def euca_run_cmd(cmd):
+   return local_execute_cmd('. %s;%s' % (EUCA_CREDENTIALS, cmd))
+
+def print_usage_and_die(program, valid_actions=None, extra_usage=[]):
+	usage=[]
+	usage.append({EXT_REQ_LIST_SNS: 'List SNs of cloud'})
+	usage.append({'%s [--remote_repo <repo>]' % EXT_REQ_LIST_PKGS: 'List Packages (downloaded/available for download)'})
+	usage.append({'%s --pkg <pkg> [--remote_repo <repo>]' % EXT_REQ_DOWNLOAD_PKG : 'Download specified package'})
+	usage.append({'%s --pkg <pkg>' % EXT_REQ_ERASE_PKG: 'Erase a package from installer repository'})
+	usage.append({'%s --pkg <pkg>' % EXT_REQ_CC_INSTALL: 'Fresh install of ccmaster/ccslave pair'})
+	usage.append({'%s --pkg <pkg> --sn_uname <sn>' % EXT_REQ_SN_INSTALL: 'Fresh install of sn'})
+	usage.append({'%s --pkg <pkg> --sn_uname <sn>' % EXT_REQ_SN_UPGRADE: 'Upgrade of SN'})
+	usage.append({'%s --pkg <pkg> [--skip_vsa_checks] [--sns | --vpsas | --ccvm]' % EXT_REQ_CLOUD_UPGRADE: 'Upgrade entire cloud (or sns/VPSAs/CCVM indvidually) with a new version of software'})
+	usage.append({'%s [--sn_uname <sn1,sn2..>]' % EXT_REQ_CHECK_NETWORKING: 'Check networking across the cloud or across specified SNs'})
+	usage.append({'%s [--pkg_path <pkg1,pkg2..>]' % EXT_REQ_CLOUD_INSTALL_PKG: 'Install list of packages on all SNs of cloud'})
+	usage.append({'%s --pkg <pkg>' % EXT_REQ_REGISTER_IMGS_IN_GLANCE: 'Register VC/CCVM image from package in glance'})
+	usage.append({'%s' % EXT_REQ_SHOW_CONFIG: 'Show installer configuration'})
+	usage.append({'%s --param <param> [--value <value>]' % EXT_REQ_SET_CONFIG: 'Set installer configuration'})
+	print 'Usage:'
+	for k in usage+extra_usage:
+		key=k.keys()[0]
+		if valid_actions and key.split()[0] not in valid_actions:
+			continue
+		print '  %-89s | %s ' % ('%s --action %s' % (program, key), k[key])
+	print ''
+	sys.exit(1)
+
+class OptObj(object):
+    pass
+
+class ZInstallLockException(Exception):
+	pass
+
+class ZInstallLock(object):
+	def __init__(self, path):
+		self.lock_file = os.path.abspath(path) + ".lock"
+		self.fp = None
+		self.lock_acquired = False
+
+	def __enter__(self):
+		try:
+			self.fp = open(self.lock_file, 'w')
+		except IOError:
+			raise ZInstallLockException("Failed to create %s" % self.lock_file)
+
+		try:
+			fcntl.flock(self.fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+			self.lock_acquired = True
+		except Exception as e:
+			raise ZInstallLockException("Failed to lock %s" % self.lock_file)
+
+	def __exit__(self, exc_type, exc_val, exc_tb):
+		if self.lock_acquired:
+			fcntl.flock(self.fp, fcntl.LOCK_UN)
+		if self.fp:
+			self.fp.close()
+			self.fp = None
+
+class ZInstallManager:
+	def __init__(self):
+		self.az_access = None
+		self.can_decrypt_user_data = False
+		self.urllib = None
+		self.urllib2 = None
+		self.progress_notify_func = None
+		self.progress_notify_ctx = None
+		self.installer_phase_msg = ''
+		self.installer_subphase_msg = ''
+		self.timeout_disable = False
+
+	def get_installer_phase(self):
+		global installer_phase
+		return installer_phase
+
+	def set_installer_phase(self, arg_installer_phase):
+		global installer_phase
+		installer_phase = arg_installer_phase
+
+	def _get_installer_phase(self):
+		global installer_phase
+		global installer_sub_phase
+
+		installer_phase=installer_phase+1
+		installer_sub_phase=0
+		return installer_phase
+
+	def _get_installer_sub_phase(self):
+		global installer_phase
+		global installer_sub_phase
+		installer_sub_phase=installer_sub_phase+1
+		return installer_phase, installer_sub_phase
+
+	def _clear_installer_phases(self):
+		self.installer_phase_msg = ''
+		self.installer_subphase_msg = ''
+
+	def _log_installer_phase_start(self, msg):
+		log(LOG_LEVEL_INFO, 'Phase-%d - %s' % (self._get_installer_phase(), msg), console=True)
+		self.installer_phase_msg = msg
+		if self.progress_notify_func:
+			self.progress_notify_func(self.progress_notify_ctx, 'Phase: %s' % msg)
+
+	def _log_installer_phase_stop(self, msg=None):
+		global installer_phase
+		msg = msg if msg else 'Done'
+		log(LOG_LEVEL_INFO, 'Phase-%d - %s\n' % (installer_phase, msg), console=True)
+		if self.progress_notify_func:
+			self.progress_notify_func(self.progress_notify_ctx, 'Phase: %s - %s' % (self.installer_phase_msg, msg))
+
+	def _log_installer_sub_phase_start(self, msg):
+		phase, sub_phase = self._get_installer_sub_phase()
+		log(LOG_LEVEL_INFO, 'Phase-%d.%d - %s' % (phase, sub_phase, msg), console=True)
+		self.installer_subphase_msg = msg
+		if self.progress_notify_func:
+			self.progress_notify_func(self.progress_notify_ctx, 'Phase: %s - (Sub Phase:%s)' % (self.installer_phase_msg, msg))
+
+	def _log_installer_sub_phase_stop(self, msg=None):
+		global installer_phase
+		global installer_sub_phase
+		msg = msg if msg else 'Done'
+		log(LOG_LEVEL_INFO, 'Phase-%d.%d - %s' % (installer_phase, installer_sub_phase, msg), console=True)
+		if self.progress_notify_func:
+			self.progress_notify_func(self.progress_notify_ctx, 'Phase: %s - (Sub Phase:%s)' % (self.installer_phase_msg, msg))
+
+	def _start_critical_section(self):
+		global in_critical_section
+		in_critical_section = True
+
+	def _end_critical_section(self):
+		global in_critical_section
+		in_critical_section = False
+		self._check_and_abort()
+
+	def _check_and_abort(self):
+		global should_abort
+		global abort_notifier
+
+		if should_abort == True:
+			if abort_notifier:
+				abort_notifier()
+			log(LOG_LEVEL_INFO, "Exitting for abort!")
+			sys.exit(0)
+
+	def set_progress_notify_handler(self, func, ctx):
+		self.progress_notify_func = func
+		self.progress_notify_ctx = ctx
+
+	def load_settings(self):
+		rc, msg=local_execute_cmd('%s -r dump_settings 2>/dev/null' % ZADARA_INSTALL_SH)
+		if rc != 0:
+			raise Exception("Could not load settings: " + msg)
+
+		try:
+			return pickle.loads(msg)
+		except Exception as e:
+			log(LOG_LEVEL_ERROR, "ERROR: Coulndt load settings. Exception[%s]" % e)
+			log_exception_stack()
+			raise e
+
+	def _load_az_access_modules(self, settings):
+		if self.az_access:
+			return
+
+		try:
+			sys.path.append(COMMON_SCRIPTS_DIR)
+			azRestApi = __import__('azRestApi')
+			usage_setting = {'CLOUD_CC' : settings['CCHA_FLOATIP_PRY'], 'ext_auth_token': settings['SERVICE_TOKEN'], 'TENANT': 0 }
+			self.az_access = azRestApi.azExtraSpecsActionsRestApi(usage_setting, _zinstall_assert)
+			self.ET = __import__("xml.etree.ElementTree", globals(), locals(), ['object'], -1)
+		except Exception as e:
+			log(LOG_LEVEL_ERROR, "ERROR: Failed to load AZ Access Modules! Cloud Upgrade can be done only after Cloud is Installed Fully!", console=True)
+			log(LOG_LEVEL_ERROR, "Exception:%s" % e)
+			sys.exit(-1) # FATAL exception. Cannot continue
+
+	def _load_decrypt_modules(self):
+		if self.can_decrypt_user_data:
+			return
+
+		try:
+			f = open('/sys/kernel/zadara/safe/aes_decrypt_key')
+			self.AES_DECRYPT_KEY = f.readline().rstrip()
+			f.close()
+			self.base64 = __import__('base64')
+			self.AES = __import__("Crypto.Cipher.AES", globals(), locals(), ['object'], -1)
+			self.can_decrypt_user_data=True
+		except Exception as e:
+			log(LOG_LEVEL_WARN, "\t- [WARN] Cannot interpret VPSA user-data", console=True)
+			log(LOG_LEVEL_ERROR, "Exception:%s" % e)
+			# Non fatal exception. Can continue
+
+	def _load_vsa_access_modules(self):
+		if self.urllib2:
+			return
+		self.urllib = __import__('urllib')
+		self.urllib2 = __import__('urllib2')
+
+	def _is_internet_enabled(self):
+		settings = self.load_settings()
+		if 'INTERNET_ACCESS' not in settings or settings['INTERNET_ACCESS'] == "1":
+			return True
+		return False
+
+	def _is_cli_run(self):
+		return os.path.basename(sys.argv[0]) == "zinstall"
+
+	# returns FE/BE/Mgmt/ExtMgmt IP for a SN
+	def _get_ip_for_sn(self, settings, sn_uname):
+		for line in settings['ALL_HOSTS_IPS'].split("\n"):
+			parts = line.split()
+			if sn_uname == parts[0]:
+				return parts[2], parts[3], parts[4], (parts[5] if len(parts) > 5 else None)
+		return None, None, None, None
+
+	# returns role for a SN
+	def _get_role_for_sn(self, settings, sn_uname):
+		for line in settings['ALL_HOSTS_IPS'].split("\n"):
+			parts = line.split()
+			if sn_uname == parts[0]:
+				return parts[1]
+		return None
+
+	# returns SN uname for role
+	def _get_sn_uname_by_role(self, settings, role):
+		for line in settings['ALL_HOSTS_IPS'].split("\n"):
+			parts = line.split()
+			if role == parts[1]:
+				return parts[0]
+		return None
+
+	def _get_all_sn_unames(self, settings):
+		sn_unames=[]
+		for sn in settings['ALL_HOSTS_IPS'].split("\n"):
+			sn_unames.append(sn.split()[0])
+		return sn_unames
+
+	# returns allocation_zone_name for a SN
+	def _get_allocation_zone_name_for_sn(self, settings, sn_uname):
+		rc, msg = local_execute_cmd('%s -r get_sn_allocation_zone_name -k %s 2>/dev/null' % (ZADARA_INSTALL_SH, sn_uname))
+		return msg
+
+	def ssh_execute(self, ip, cmd, timeout=0, print_stdout=False, port=None):
+		ssh_cmd = ['ssh', '-q']
+		if self.timeout_disable:
+			timeout=0
+		if timeout == 0:
+			ssh_cmd = ssh_cmd + ['-t', '-t']
+		if port:
+			ssh_cmd = ssh_cmd + ['-p', port]
+		ssh_cmd = ssh_cmd + ['-i', '/etc/zadara/zadmin.pem', '-o', 'UserKnownHostsFile=/dev/null']
+		ssh_cmd = ssh_cmd + ['-o', 'StrictHostKeyChecking=no', '-o', 'PasswordAuthentication=no', 'zadmin@%s' % ip, 'sudo']
+		for v in cmd:
+			ssh_cmd.append(v)
+		log(LOG_LEVEL_INFO, "Performing SSH[%s] - %s" % (ip, cmd))
+		return execute_cmd_by_subprocess(ssh_cmd, timeout, log_execution=False, print_stdout=print_stdout)
+
+	def scp_execute(self, src, target, timeout=0, print_stdout=False):
+		scp_cmd = ['scp', '-i', '/etc/zadara/zadmin.pem', '-o', 'UserKnownHostsFile=/dev/null']
+		if self.timeout_disable:
+			timeout=0
+		scp_cmd = scp_cmd + ['-o', 'StrictHostKeyChecking=no', '-o', 'PasswordAuthentication=no', '-r', src, target]
+		log(LOG_LEVEL_INFO, "Performing SCP - %s" % scp_cmd)
+		return execute_cmd_by_subprocess(scp_cmd, timeout, log_execution=False, print_stdout=print_stdout)
+
+	def _assign_ip_on_intf(self, action, sn_ip, intf, ip=None, vlan=None, pingip=None, unassign_after_ping=None):
+		ssh_cmd = [ZINSTALL, '--action', action, '--intf', intf]
+		if ip:
+			ssh_cmd = ssh_cmd + ['--ip', ip]
+		if vlan:
+			ssh_cmd = ssh_cmd + ['--vlan', vlan]
+		if pingip:
+			ssh_cmd = ssh_cmd + ['--pingip', pingip]
+		if unassign_after_ping:
+			ssh_cmd = ssh_cmd + ['--unassign_after_ping']
+
+		rc, out, err = self.ssh_execute(sn_ip, ssh_cmd)
+		return rc
+
+	def _do_ping(self, ip, intf):
+		# first try a shorter span ping for few iterations
+		for i in range(0,5):
+			rc, out, err = execute_cmd_by_subprocess(['ping', '-I', intf, '-c', '2', ip], timeout=5)
+			if rc == 0:
+				break
+		if rc != 0:
+			# short-span one failed. Try longer span ping to make sure we are not missing out anything
+			rc, out, err = execute_cmd_by_subprocess(['ping', '-I', intf, '-c', '6', ip], timeout=20)
+		return rc
+
+	def assign_ip_on_intf(self, opts):
+		intf=opts.intf
+		if opts.vlan:
+			execute_cmd_by_subprocess(['vconfig','add', opts.intf, opts.vlan])
+
+			intf='%s.%s' % (opts.intf, opts.vlan)
+
+		execute_cmd_by_subprocess(['ifconfig', opts.intf, 'up'])
+		if opts.vlan:
+			execute_cmd_by_subprocess(['ifconfig', intf, 'up'])
+
+		execute_cmd_by_subprocess(['ip', 'addr', 'add', opts.ip, 'dev', intf])
+
+		rc=0
+		if opts.pingip:
+			rc = self._do_ping(opts.pingip, intf)
+
+		if opts.unassign_after_ping:
+			self.unassign_ip_on_intf(opts)
+
+		return rc
+
+	def ping_ip_on_intf(self, opts):
+		return self._do_ping(opts.pingip, opts.intf)
+
+	def unassign_ip_on_intf(self, opts):
+		intf=opts.intf
+		if opts.vlan:
+			intf='%s.%s' % (opts.intf, opts.vlan)
+
+		execute_cmd_by_subprocess(['ip', 'addr', 'del', opts.ip, 'dev', intf])
+
+		execute_cmd_by_subprocess(['ifconfig', intf, 'down'])
+
+		if opts.vlan:
+			execute_cmd_by_subprocess(['ifconfig', opts.intf, 'down'])
+			execute_cmd_by_subprocess(['vconfig', 'rem', intf])
+		return 0
+
+	# Helper to update /etc/udev/rules.d/70-persistent-net.rules with target-intf co-ordinates
+	def _update_udev_persistent_net_rules(self, source_intf, target_intf, reason):
+		mac, pci_dev, driver, vendor, dev_id = get_net_details_for_intf(source_intf)
+		log(LOG_LEVEL_INFO, 'Rename intf=%s PCIaddr=%s driver=%s vendor=%s dev_id=%s => target_intf=%s (reason=%s)' % (source_intf, pci_dev, driver, vendor, dev_id, target_intf, reason))
+
+		# form udev rule statements
+		udev_comment='# PCI device %s:%s (dev_id=%s) (%s) (zadara:%s)' % (vendor, pci_dev, dev_id, driver, reason)
+		udev_rule='SUBSYSTEM=="net", ACTION=="add", DRIVERS=="?*", ATTR{address}=="%s", ATTR{dev_id}=="%s", ATTR{type}=="1", KERNEL=="eth*", NAME="%s"' % (mac, dev_id, target_intf)
+
+		skip_next_blank_line=False
+		last_line_is_blank=True
+		target_filename='/tmp/udev.rules.%d' % random.randint(0,10000)
+		target_f=open(target_filename, "w")
+		with open (UDEV_NET_PERSISTENT_RULES, "r") as source_f:
+			for line in source_f.readlines():
+				# skip the udev comment line that we will replace with
+				my_dev_id_str = 'dev_id=%s' % dev_id
+				if line.startswith('#') and vendor in line and pci_dev in line and my_dev_id_str in line:
+					continue
+				# skip the line concerning our PCI address but without dev_id at all
+				if line.startswith('#') and vendor in line and pci_dev in line and not "dev_id" in line:
+					continue
+
+				# skip the udev rule line that we will replace with
+				if not line.startswith('#') and 'DRIVERS' in line and 'NAME' in line:
+					intf=line.split('NAME=')[-1].strip().split('\"')[1]
+					if intf == source_intf or intf == target_intf:
+						skip_next_blank_line=True
+						continue
+
+				if skip_next_blank_line and not line.strip():
+					skip_next_blank_line=False
+					continue
+
+				target_f.write(line)
+				last_line_is_blank=True if not line.strip() else False
+
+		if not last_line_is_blank:
+			target_f.write('\n')
+		target_f.write('%s\n' % udev_comment)
+		target_f.write('%s\n' % udev_rule)
+		target_f.close()
+		local_execute_cmd('mv %s %s' % (target_filename, UDEV_NET_PERSISTENT_RULES))
+
+	# Helper to update /etc/network/interfaces with revised target-intf co-ordinates
+	def _update_etc_network_interfaces(self, source_intf, target_intf, reason, settings, mgmt_ip):
+		# if MGMT==HB network, then setup the entire interfaces file with pre-defined template
+		if 'mgmt_hb' in reason:
+
+			# setup a new interfaces file as MGMT==HB network
+			interfaces_line='# This file describes the network interfaces available on your system\n'
+			interfaces_line+='# and how to activate them. For more information, see interfaces(5).\n\n'
+			interfaces_line+='# The loopback network interface\n'
+			interfaces_line+='auto lo\n'
+			interfaces_line+='iface lo inet loopback\n\n'
+			interfaces_line+='# The primary network interface, HB network\n'
+			interfaces_line+='auto %s\n' % settings['MGMT_NETWORK_BRIDGE']
+			interfaces_line+='iface %s inet static\n' % settings['MGMT_NETWORK_BRIDGE']
+			interfaces_line+='\tbridge_ports %s\n' % settings['MGMT_NETWORK_IFACE']
+			interfaces_line+='\tbridge_stp off\n'
+			interfaces_line+='\tbridge_maxwait 0\n'
+			interfaces_line+='\tbridge_fd 0\n'
+			interfaces_line+='\taddress %s\n' % mgmt_ip
+			interfaces_line+='\tnetmask %s\n' % cidr_to_netmask(int(settings['MGMT_NETWORK_BITS']))
+			interfaces_line+='\tnetwork %s\n' % settings['MGMT_NETWORK']
+			if 'MGMT_NETWORK_GATEWAY' in settings:
+				interfaces_line+='\tgateway %s\n' % settings['MGMT_NETWORK_GATEWAY']
+			if 'MGMT_NETWORK_BROADCAST' in settings:
+				interfaces_line+='\tbroadcast %s\n' % settings['MGMT_NETWORK_BROADCAST']
+			interfaces_line+='\tdns-nameservers %s\n\n' % settings['MGMT_NETWORK_DNS1']
+
+			f=open(ETC_NETWORK_INTERFACES, "w")
+			f.write(interfaces_line)
+			f.close()
+		else:
+			# This is just the mgmt network (not mixed with HB network). update interface name alone
+			local_execute_cmd("sed -e 's, %s , %s ,g' -e 's, %s$, %s,g' -i %s" % (source_intf, target_intf, source_intf, target_intf, ETC_NETWORK_INTERFACES))
+
+	def _update_etc_hosts(self, sn_uname, be_ip):
+		target_filename='/tmp/etc.hosts.%d' % random.randint(0,10000)
+		target_f=open(target_filename, "w")
+
+		with open (ETC_HOSTS, "r") as source_f:
+			for line in source_f.readlines():
+				# skip the udev comment line that we will replace with
+				if sn_uname in line:
+					continue
+				target_f.write(line)
+		target_f.write('%s\t%s\n' % (be_ip, sn_uname))
+		target_f.close()
+		local_execute_cmd('mv %s %s' % (target_filename, ETC_HOSTS))
+
+	def rename_network_intf(self, opts):
+		self._update_udev_persistent_net_rules(opts.source_intf, opts.target_intf, opts.reason)
+
+		# if we are touching the mgmt interface, make sure /etc/network/interfaces is updated about it
+		if 'mgmt' in opts.reason:
+			sn_uname=os.uname()[1]
+			settings=self.load_settings()
+			fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, sn_uname)
+
+			self._update_etc_network_interfaces(opts.source_intf, opts.target_intf, opts.reason, settings, mgmt_ip)
+			self._update_etc_hosts(sn_uname, be_ip)
+
+		return 0
+
+	def _interpret_10g_network_check_results(self, working_intfs, network):
+		# process return
+		if len(working_intfs) != 2:
+			# if on key side we have just one index, check if it has reference ip set in. otherwise error out
+			if len(working_intfs) == 1 and 'reference_ip' not in working_intfs.keys()[0]:
+				log(LOG_LEVEL_ERROR, 'ERROR: %s Networking is not working!' % network, console=True)
+				return -1
+
+		for k in working_intfs:
+			if len(working_intfs[k]) == 1 and 'reference_ip' in working_intfs[k][0]:
+				# skip reference IP interfaces as they are bound to have only one thing validated on
+				continue
+
+			if len(working_intfs[k]) != 2:
+				log(LOG_LEVEL_ERROR, 'ERROR: %s has connectivity over %s & not on 2-ports as expected!' % (k, working_intfs[k]), console=True)
+				return -1
+		return 0
+
+	def _check_networking_between_sns_on_network(self, settings, sn1, sn2, network, vlan, cidr, ip_type):
+		working_intfs={}
+		sn1_working_intfs=[]
+		sn2_working_intfs=[]
+		sn1_has_reference_ip=False
+		sn2_has_reference_ip=False
+		self._start_critical_section()
+		for sn1_network in sn1[network]:
+			# dont touch configured interfaces
+			if 'ip' in sn1_network:
+				continue
+
+			sn1_intf=sn1_network['intf']
+			sn1_ip_cidr="%s/%s" % (sn1[ip_type], cidr)
+			if sn1_ip_cidr in sn1['net_info']['assigned_ips']:
+				# SN1 already has IP on an interfacde. just use it up as the reference. Dont try assign/unassign on any other interface
+				sn1_has_reference_ip=True
+				sn1_intf=sn1['net_info']['assigned_ips'][sn1_ip_cidr]
+
+			if not sn1_has_reference_ip:
+				# assign IP on SN1
+				self._assign_ip_on_intf(INT_REQ_ASSIGN_IP_ON_INTF, sn1['ip'], sn1_intf, "%s/%s" % (sn1[ip_type], cidr), vlan)
+
+			for sn2_network in sn2[network]:
+				# dont touch configured interfaces
+				if 'ip' in sn2_network:
+					continue
+
+				sn2_intf=sn2_network['intf']
+				sn2_ip_cidr="%s/%s" % (sn2[ip_type], cidr)
+				if sn2_ip_cidr in sn2['net_info']['assigned_ips']:
+					# SN2 already has IP on an interfacde. just use it up as the reference. Dont try assign/unassign on any other interface
+					sn2_has_reference_ip=True
+					sn2_intf=sn2['net_info']['assigned_ips'][sn2_ip_cidr]
+
+				if not sn2_has_reference_ip:
+					# assign IP on SN2 & test ping
+					rc = self._assign_ip_on_intf(INT_REQ_ASSIGN_IP_ON_INTF, sn2['ip'], sn2_intf, "%s/%s" % (sn2[ip_type], cidr), vlan, pingip=sn1[ip_type], unassign_after_ping=True)
+				else:
+					time.sleep(2)
+					# just test ping
+					rc = self._assign_ip_on_intf(INT_REQ_PING_IP_ON_INTF, sn2['ip'], sn2_intf, ip=None, vlan=None, pingip=sn1[ip_type], unassign_after_ping=None)
+
+				connect_str = "%s/%s[%s] <> %s/%s[%s]" % (sn1['uname'], sn1_intf, sn1[ip_type], sn2['uname'], sn2_intf, sn2[ip_type])
+				if rc == 0:
+					k = '%s/%s%s' % (sn1['uname'], sn1_intf, "[reference_ip]" if sn1_has_reference_ip else "")
+					v = '%s/%s%s' % (sn2['uname'], sn2_intf, "[reference_ip]" if sn2_has_reference_ip else "")
+					if k not in working_intfs:
+						working_intfs[k] = [v]
+					else:
+						working_intfs[k].append([v])
+
+					if sn1_intf not in sn1_working_intfs:
+						sn1_working_intfs.append(sn1_intf)
+
+					if sn2_intf not in sn2_working_intfs:
+						sn2_working_intfs.append(sn2_intf)
+
+					log(LOG_LEVEL_INFO, "\t- Success on %s" % connect_str, console=True)
+				else:
+					log(LOG_LEVEL_ERROR, "\t- Failed on %s" % connect_str, console=True)
+
+				# if sh2 has reference IP, no point to loop this inner loop
+				if sn2_has_reference_ip:
+					break
+
+			if not sn1_has_reference_ip:
+				# unassign IP on SN1
+				self._assign_ip_on_intf(INT_REQ_UNASSIGN_IP_ON_INTF, sn1['ip'], sn1_intf, "%s/%s" % (sn1[ip_type], cidr), vlan)
+			else:
+				# if sh1 has reference IP, no point to loop this inner loop
+				break
+		self._end_critical_section()
+		return working_intfs, sn1_working_intfs, sn2_working_intfs
+
+	def _check_networking_between_sns(self, settings, sn1, sn2):
+		sn_fe_working_intfs=[]
+		sn_be_working_intfs=[]
+		sn_unames = []
+		sn_unames.append(sn1['uname'])
+		sn_unames.append(sn2['uname'])
+
+		"""
+		    First validate FE networking between the SNs
+		"""
+		self._log_installer_sub_phase_start('Validating FE Network (between [%s] <> [%s])' % (sn1['uname'], sn2['uname']))
+
+		fe_vlan = str(settings['FE_NETWORK_VLAN_ID']) if 'FE_NETWORK_VLAN_ID' in settings else None
+		fe_cidr = settings['FE_NETWORK_BITS']
+		fe_working_intfs, sn1_fe_working_intfs, sn2_fe_working_intfs = self._check_networking_between_sns_on_network(settings, sn1, sn2, '10g_networks', fe_vlan, fe_cidr, 'fe_ip')
+		sn_fe_working_intfs.append(sn1_fe_working_intfs)
+		sn_fe_working_intfs.append(sn2_fe_working_intfs)
+
+		rc = self._interpret_10g_network_check_results(fe_working_intfs, 'FE')
+		if rc != 0:
+			return rc
+
+		self._log_installer_sub_phase_stop()
+
+		"""
+		    Validate BE networking between the SNs
+		"""
+		self._log_installer_sub_phase_start('Validating BE Network (between [%s] <> [%s])' % (sn1['uname'], sn2['uname']))
+
+		be_vlan = str(settings['BE_NETWORK_VLAN_ID']) if 'BE_NETWORK_VLAN_ID' in settings else None
+		be_cidr = settings['BE_NETWORK_BITS']
+		be_working_intfs, sn1_be_working_intfs, sn2_be_working_intfs = self._check_networking_between_sns_on_network(settings, sn1, sn2, '10g_networks', be_vlan, be_cidr, 'be_ip')
+		sn_be_working_intfs.append(sn1_be_working_intfs)
+		sn_be_working_intfs.append(sn2_be_working_intfs)
+
+		rc = self._interpret_10g_network_check_results(be_working_intfs, 'BE')
+		if rc != 0:
+			return rc
+
+		# some additional network checks
+		target_10g_intfs = settings['PF_DEV_NAMES'].split()
+		for i in range(0,2):
+			if len(sn_be_working_intfs[i]) != len(sn_fe_working_intfs[i]):
+				log(LOG_LEVEL_ERROR, 'ERROR: Varying list of interfaces for BE[%s] & FE[%s] networking on [%s]' % (sn_be_working_intfs[i], sn_fe_working_intfs[i], sn_unames[i]), console=True)
+				return -1
+
+			if len(target_10g_intfs) != len(sn_be_working_intfs[i]):
+				# if the be-working intf already has bonding setup, ignore it
+				if len(sn_be_working_intfs[i]) == 1 and 'bond' in sn_be_working_intfs[i][0]:
+					continue
+
+				log(LOG_LEVEL_ERROR, 'ERROR: Target interfaces[%s] doesnt match actual[%s]' % (target_10g_intfs, sn_be_working_intfs[i]), console=True)
+				return -1
+
+			for intf in sn_be_working_intfs[i]:
+				if intf not in sn_fe_working_intfs[i]:
+					log(LOG_LEVEL_ERROR, 'ERROR: Interface[%s] on [%s] is working on BE network & not on FE network!' % (intf, sn_unames[i]), console=True)
+					return -1
+
+		self._log_installer_sub_phase_stop()
+
+		if '10g_working_intfs' not in sn1:
+			sn1['10g_working_intfs'] = sn1_be_working_intfs
+
+		if '10g_working_intfs' not in sn2:
+			sn2['10g_working_intfs'] = sn2_be_working_intfs
+
+		"""
+		    validate HB networking between the SNs
+		"""
+		if sn1['ip'] == sn1['mgmt_ip']:
+			self._log_installer_sub_phase_start('Skipping 1 HB network check as MGMT == HB Network')
+			for sn1_network in sn1['1g_networks']:
+				if 'ip' in sn1_network and sn1_network['ip'] == sn1['mgmt_ip']:
+					sn1['1g_working_intfs'] = [sn1_network['intf']]
+					break
+			for sn2_network in sn2['1g_networks']:
+				if 'ip' in sn2_network and sn2_network['ip'] == sn2['mgmt_ip']:
+					sn2['1g_working_intfs'] = [sn2_network['intf']]
+					break
+			self._log_installer_sub_phase_stop()
+			return 0
+
+		self._log_installer_sub_phase_start('Validating 1G HB Network (between [%s] <> [%s])' % (sn1['uname'], sn2['uname']))
+		mgmt_vlan = str(settings['MGMT_NETWORK_VLAN_ID']) if 'MGMT_NETWORK_VLAN_ID' in settings else None
+		mgmt_cidr = settings['MGMT_NETWORK_BITS']
+		mgmt_working_intfs, sn1_mgmt_working_intfs, sn2_mgmt_working_intfs = self._check_networking_between_sns_on_network(settings, sn1, sn2, '1g_networks', mgmt_vlan, mgmt_cidr, 'mgmt_ip')
+		if len(mgmt_working_intfs) == 0:
+			log(LOG_LEVEL_ERROR, 'ERROR: 1G HB network not working on any interface!', console=True)
+			return -1
+
+		if len(mgmt_working_intfs) != 1:
+			log(LOG_LEVEL_ERROR, 'ERROR: 1G HB network working on multiple interfaces[%s]. Cant safely determine the interface to use!' % mgmt_working_intfs, console=True)
+			return -1
+
+		self._log_installer_sub_phase_stop()
+
+		if '1g_working_intfs' not in sn1:
+			sn1['1g_working_intfs'] = sn1_mgmt_working_intfs
+
+		if '1g_working_intfs' not in sn2:
+			sn2['1g_working_intfs'] = sn2_mgmt_working_intfs
+
+		return 0
+
+	def _check_networking(self, settings, sns):
+		self._log_installer_phase_start('Validating Networking')
+		ref_sn=sns[0]
+		for sn in sns[1:]:
+			rc = self._check_networking_between_sns(settings, ref_sn, sn)
+			if rc != 0:
+				log(LOG_LEVEL_ERROR, 'ERROR: Networking check between [%s] & [%s] failed' % (ref_sn['uname'], sn['uname']), console=True)
+				return rc
+		self._log_installer_phase_stop()
+		return 0
+
+	def _get_networks_by_driver(self, sn, match_drivers=[], dont_match_drivers=[]):
+		driver_networks=[]
+		for network in sn['net_info']['interfaces']:
+			if match_drivers and network['driver'] in match_drivers:
+				driver_networks.append(network)
+			elif dont_match_drivers and network['driver'] not in dont_match_drivers:
+				driver_networks.append(network)
+		return driver_networks
+
+	def _update_networking_info(self, settings, sns):
+		self._log_installer_phase_start('Gathering Networking Topology on SNs')
+		for sn in sns:
+			rc, out, err = execute_cmd_by_subprocess(['ping', '-c', '1', '-W', '2', sn['ip']], timeout=5)
+			if rc != 0:
+				log(LOG_LEVEL_ERROR, 'ERROR: Failed to ping %s[%s] on [%s]!' % (sn['uname'], sn['role'], sn['ip']), console=True)
+				return -1
+
+			rc, out, err = self.ssh_execute(sn['ip'], [ZINSTALL, '--action', INT_REQ_DUMP_NODE_NETWORK_INFO])
+			if rc != 0:
+				log(LOG_LEVEL_ERROR, 'ERROR: Failed to dump networking info on %s[%s]/[%s]!' % (sn['uname'], sn['role'], sn['ip']), console=True)
+				return -1
+
+			sn['net_info']=json.loads(out.strip())
+			sn['10g_networks']=self._get_networks_by_driver(sn, match_drivers=['ixgbe', 'mlx4_core'])
+			sn['1g_networks']=self._get_networks_by_driver(sn, dont_match_drivers=['ixgbe', 'mlx4_core'])
+			sn['fe_ip'], sn['be_ip'], sn['mgmt_ip'], extmgmt_ip = self._get_ip_for_sn(settings, sn['uname'])
+			if not sn['fe_ip'] or not sn['be_ip'] or not sn['mgmt_ip']:
+				log(LOG_LEVEL_ERROR, 'ERROR: Failed to get SN IPs for [%s] from settings' % sn['uname'], console=True)
+				return -1
+
+			log(LOG_LEVEL_INFO, '\t- Gathered successfully on %s[%s]' % (sn['uname'], sn['role']), console=True)
+			log(LOG_LEVEL_INFO, '\t- BE/FE networks: %s' % sn['10g_networks'], console=True)
+			log(LOG_LEVEL_INFO, '\t- 1G networks: %s' % sn['1g_networks'], console=True)
+			log(LOG_LEVEL_INFO, '\t- fe_ip: %s' % sn['fe_ip'], console=True)
+			log(LOG_LEVEL_INFO, '\t- be_ip: %s' % sn['be_ip'], console=True)
+			log(LOG_LEVEL_INFO, '\t- mgmt_ip: %s' % sn['mgmt_ip'], console=True)
+
+		self._log_installer_phase_stop()
+		return 0
+
+	def _ensure_vlan_pkg_on_sns(self, settings, sns):
+		self._log_installer_phase_start('Setting up VLAN package on SNs')
+		for sn in sns:
+			rc, out, err = execute_cmd_by_subprocess(['ping', '-c', '1', '-W', '2', sn['ip']], timeout=5)
+			if rc != 0:
+				log(LOG_LEVEL_ERROR, 'ERROR: Failed to ping %s[%s] on [%s]!' % (sn['uname'], sn['role'], sn['ip']), console=True)
+				return -1
+
+			rc, out, err = self.ssh_execute(sn['ip'], [ZINSTALL, '--action', INT_REQ_ENSURE_VLAN_PKG], print_stdout=True)
+			if rc != 0:
+				log(LOG_LEVEL_ERROR, 'ERROR: Failed to setup VLAN package on[%s]!' % sn['uname'], console=True)
+				return -1
+
+		self._log_installer_phase_stop()
+		return 0
+
+	def _update_and_check_networking(self, settings, sns):
+		# first update current neteworking of all given SNs
+		rc = self._update_networking_info(settings, sns)
+		if rc != 0:
+			log(LOG_LEVEL_ERROR, 'ERROR: Failed to Gather networking information from SNs!', console=True)
+			return rc
+
+		rc = self._ensure_vlan_pkg_on_sns(settings, sns)
+		if rc != 0:
+			log(LOG_LEVEL_ERROR, 'ERROR: Failed to setup VLAN package on SNs!', console=True)
+			return rc
+
+		# check networking on 10G & 1G networks
+		rc = self._check_networking(settings, sns)
+		if rc != 0:
+			log(LOG_LEVEL_ERROR, 'ERROR: Networking check failed!', console=True)
+			return rc
+		return 0
+
+	"""
+	Get connection status & installed package versions
+	"""
+	def _get_sn_status(self, sn_uname, sn_ip):
+		# first check if SN is up
+		rc, out, err = execute_cmd_by_subprocess(['ping', '-c', '1', '-W', '5', sn_ip], timeout=5)
+		if rc != 0:
+			return 'down', 'unknown', 'unknown', 'unknown'
+
+		nova_version = sn_version = installer_version = '<unknown>'
+		rc, out, err = self.ssh_execute(sn_ip, ['dpkg -l zadarasn nova-compute zadara-installer'], timeout=14)
+		if (rc != 0 and rc != 1) or not out:
+			return 'installer-missing', 'unknown', 'unknown', 'unknown'
+
+		nova_version = sn_version = installer_version = 'not-installed'
+		for line in out.split("\n"):
+			if 'nova-' in line:
+				nova_version=line.split()[2]
+				nova_version=nova_version.split('-diablo')[0]
+			if 'zadarasn' in line:
+				sn_version=line.split()[2]
+			if 'zadara-installer' in line:
+				installer_version=line.split()[2]
+		return 'connected', nova_version, sn_version, installer_version
+
+	def _install_step1_test_internet_access_on_sn(self, settings, sn):
+		# Step-1: Test if internet access from SN works
+		self._log_installer_sub_phase_start('Checking if SN can connect to internet to download packages')
+		self.ensure_apt_setup_for_proxy(sn)
+		cmd=['sh -c "cd /tmp/;apt-get download gdb;rm -f /tmp/gdb_*amd64.deb"']
+		rc, out, err = self.ssh_execute(sn['ip'], cmd)
+		if rc != 0:
+			log(LOG_LEVEL_ERROR, 'ERROR: SN[%s] cannot download packages from internet! Aborting installation!' % sn['uname'], console=True)
+			return -1
+
+		self._log_installer_sub_phase_stop()
+		return rc
+
+	"""
+	Computes network interfaces that need to be renamed and executes the steps on target sn
+	"""
+	def _install_step2_rename_network_intfs(self, settings, sn):
+		self._log_installer_sub_phase_start('Renaming network interfaces')
+
+		rename_intf_reason={}
+		rename_intfs_10g={}
+
+		# first rename 10G interfaces
+		if len(sn['10g_working_intfs']) == 1 and 'bond' in sn['10g_working_intfs'][0]:
+			log(LOG_LEVEL_INFO, '\t- BE/FE interfaces fully configured! Not attempting interface rename', console=True)
+		else:
+			target_10g_intfs = settings['PF_DEV_NAMES'].split()
+			for intf in sn['10g_working_intfs']:
+				if intf in target_10g_intfs:
+					# no need to rename this intf, just mark it with same name
+					rename_intfs_10g[intf]=intf
+					rename_intf_reason[intf]='10g_be_fe'
+					target_10g_intfs = list(filter((intf).__ne__, target_10g_intfs))
+
+			# if we have some intfs in target to be renamed
+			if len(target_10g_intfs) > 0:
+				for intf in sn['10g_working_intfs']:
+					if intf not in rename_intfs_10g:
+						new_intf=target_10g_intfs[0]
+						rename_intfs_10g[intf]=new_intf
+						rename_intf_reason[intf]='10g_be_fe'
+						target_10g_intfs = list(filter((new_intf).__ne__, target_10g_intfs))
+						if (len(target_10g_intfs)) < 1:
+							break
+
+			# look for left-over 10G interfaces & rename them as well
+			index = len(sn['10g_working_intfs']) + 1
+			for network in sn['10g_networks']:
+				intf=network['intf']
+				if intf not in rename_intfs_10g:
+					rename_intfs_10g[intf]='eth10G%d' % index
+					rename_intf_reason[intf]='10g_misc'
+					index = index+1
+
+		rename_intfs_1g={}
+		target_intfs=[]
+		if len(sn['1g_working_intfs']) == 1 and sn['1g_working_intfs'][0] == settings['MGMT_NETWORK_BRIDGE']:
+			log(LOG_LEVEL_INFO, '\t- 1G interfaces fully configured! Not attempting interface rename', console=True)
+		else:
+			# if mgmt network != hb network, assign the working 1G network as mgmt network
+			if settings['MGMT_NETWORK_IFACE'] != settings['INET_ACCESS_IFACE']:
+				intf=sn['1g_working_intfs'][0]
+				rename_intfs_1g[intf]=settings['MGMT_NETWORK_IFACE']
+				rename_intf_reason[intf]='1g_hb'
+				target_intfs.append(settings['MGMT_NETWORK_IFACE'])
+				seperate_hb_network=True
+			else:
+				seperate_hb_network=False
+
+			for network in sn['1g_networks']:
+				# if this network is the ext-mgmt network, give the INET-ACCESS-IFACE name
+				if 'ip' in network and network['ip'] == sn['ip']:
+					intf = network['intf']
+					rename_intfs_1g[intf]=settings['INET_ACCESS_IFACE']
+					if seperate_hb_network:
+						rename_intf_reason[intf]='1g_mgmt'
+					else:
+						rename_intf_reason[intf]='1g_mgmt_hb'
+					target_intfs.append(settings['INET_ACCESS_IFACE'])
+					break
+
+			# rename the rest of 1G network interfaces
+			index=1000
+			for network in sn['1g_networks']:
+				intf=network['intf']
+				if intf not in rename_intfs_1g:
+					# get a get a target intf name that we havent yet assigned
+					while True:
+						target_intf = 'eth%d' % index
+						index=index+1
+						if target_intf not in target_intfs:
+							break
+					rename_intfs_1g[intf]=target_intf
+					rename_intf_reason[intf]='1g_misc'
+					target_intfs.append(target_intf)
+
+		rename_intfs=dict(rename_intfs_10g.items() + rename_intfs_1g.items())
+
+		for intf in rename_intfs:
+			if intf != rename_intfs[intf]:
+				log(LOG_LEVEL_INFO, '\t- Renaming [%s] to [%s] (tag:%s)' % (intf, rename_intfs[intf], rename_intf_reason[intf]), console=True)
+			else:
+				log(LOG_LEVEL_INFO, '\t- Ensuring that interface name [%s] (tag:%s) is correctly setup' % (intf, rename_intf_reason[intf]), console=True)
+			ssh_cmd = [ZINSTALL, '--action', 'rename_network_intf', '--source_intf', intf]
+			ssh_cmd = ssh_cmd + ['--target_intf', rename_intfs[intf], '--reason', rename_intf_reason[intf]]
+			rc, out, err = self.ssh_execute(sn['ip'], ssh_cmd)
+			if rc != 0:
+				log(LOG_LEVEL_ERROR, 'ERROR: Failed to rename [%s] to [%s] on %s[%s]!' % (intf, rename_intfs[intf], sn['uname'], sn['role']), console=True)
+				return rc
+
+		self._log_installer_sub_phase_stop()
+		return 0
+
+	"""
+	Internal helper to stage package
+	"""
+	def int_stage_pkg_for_install(self, opts):
+		if not os.path.exists(ZPKGS_STAGING_DIR):
+			os.mkdir(ZPKGS_STAGING_DIR)
+
+		# cleanup stale staged directories
+		for d in os.listdir(ZPKGS_STAGING_DIR):
+			if d != opts.pkg:
+				log(LOG_LEVEL_INFO, 'Cleaning up stale staged directory for package[%s]' % d)
+				local_execute_cmd('rm -rf %s' % os.path.join(ZPKGS_STAGING_DIR, d))
+
+		staging_dir=os.path.join(ZPKGS_STAGING_DIR, opts.pkg)
+		if os.path.exists(staging_dir):
+			if os.path.exists(os.path.join(staging_dir, '.staging_complete')):
+				log(LOG_LEVEL_INFO, 'Package[%s] is already staged!' % opts.pkg)
+				return 0
+
+			local_execute_cmd('rm -rf %s' % staging_dir)
+
+		rc, out, err = self.scp_execute('zadmin@%s' % opts.staging_source, ZPKGS_STAGING_DIR)
+		if rc == 0:
+			local_execute_cmd('touch %s/.staging_complete' % staging_dir)
+		else:
+			log(LOG_LEVEL_ERROR, "Failed to stage from[%s] to[%s] (rc:%d/err[%s])" % (opts.staging_source, ZPKGS_STAGING_DIR, rc, err), console=True)
+		return rc
+
+	"""
+	Stages package to be installed on the node
+	"""
+	def _stage_packages_for_install(self, settings, sn, pkg_coords, reason):
+		self._log_installer_sub_phase_start('Staging Package[%s] for %s!' % (pkg_coords['pkg'], reason))
+
+		ssh_cmd = [ZINSTALL, '--action', INT_REQ_STAGE_PKG_FOR_INSTALL, '--pkg', pkg_coords['pkg']]
+		ssh_cmd = ssh_cmd + ['--staging_source', '%s:%s/%s' % (pkg_coords['ccmaster_ip'], pkg_coords['pkg_repo'], pkg_coords['pkg'])]
+		rc, out, err = self.ssh_execute(sn['ip'], ssh_cmd, print_stdout=True)
+		if rc != 0:
+			log(LOG_LEVEL_ERROR, 'ERROR: Failed to stage packages on %s[%s] (rc:%d/err:%s)!' % (sn['uname'], sn['role'], rc, err), console=True)
+			return -1
+
+		self._log_installer_sub_phase_stop()
+		return 0
+
+	"""
+	Internal helper to de-stage package
+	"""
+	def int_destage_pkg_after_install(self, opts):
+		if not os.path.exists(ZPKGS_STAGING_DIR):
+			return 0
+
+		staging_dir=os.path.join(ZPKGS_STAGING_DIR, opts.pkg)
+		if os.path.exists(staging_dir):
+			local_execute_cmd('rm -rf %s' % staging_dir)
+		return 0
+
+	"""
+	De-stages package after installation
+	"""
+	def _destage_packages_after_install(self, settings, sn, pkg_coords, reason):
+		self._log_installer_sub_phase_start('De-Staging Package[%s] after %s!' % (pkg_coords['pkg'], reason))
+
+		ssh_cmd = [ZINSTALL, '--action', INT_REQ_DESTAGE_PKG_AFTER_INSTALL, '--pkg', pkg_coords['pkg']]
+		rc, out, err = self.ssh_execute(sn['ip'], ssh_cmd, print_stdout=True)
+		if rc != 0:
+			log(LOG_LEVEL_WARN, 'WARN: Failed to de-stage package on %s[%s]!' % (sn['uname'], sn['role']), console=True)
+		self._log_installer_sub_phase_stop()
+		return 0
+
+	def _run_zadara_installsh_on_sn(self, settings, sn, pkg_coords, action, component=None, forced_role=None):
+		msg='Running _zadara_install(%s:%s)' % (action, (component if component else 'all'))
+		self._log_installer_sub_phase_start(msg)
+
+		self.ensure_apt_setup_for_proxy(sn)
+
+		ssh_cmd = [ZADARA_INSTALL_SH, '-y', '-p', os.path.join(ZPKGS_STAGING_DIR, pkg_coords['pkg']), '-m', action]
+		if component:
+			ssh_cmd = ssh_cmd + ['-c', component]
+		if forced_role:
+			ssh_cmd = ssh_cmd + ['-n', forced_role]
+
+		self._start_critical_section()
+		rc, out, err = self.ssh_execute(sn['ip'], ssh_cmd, print_stdout=True)
+		self._end_critical_section()
+		if rc != 0:
+			log(LOG_LEVEL_ERROR, 'Failed %s (rc:%d/err:%s)' % (msg, rc, err), console=True)
+			return rc
+
+		self._log_installer_sub_phase_stop()
+		return 0
+
+	def _do_waited_operation(self, funcname, msg, obj, interval=1, eval_msg_fn=None):
+		func = getattr(self, funcname)
+
+		x=0
+		done=False
+		past_print=None
+		progress_indicator=['|','/', '-','\\']
+		while True:
+			c=progress_indicator[x%4]
+			x=x+1
+
+			msg = getattr(self, eval_msg_fn)(obj) if eval_msg_fn else msg
+			out_msg= msg + " [" + c + "]" if not done else msg
+
+			if self.progress_notify_func:
+				self.progress_notify_func(self.progress_notify_ctx, 'Phase: %s - %s - %s' % (self.installer_phase_msg, self.installer_subphase_msg, msg))
+
+			# if we printed in the past on the same-line, wipe it off first
+			if past_print:
+				sys.stdout.write('\r%s' % (' ' * past_print))
+				sys.stdout.flush()
+
+			sys.stdout.write('\r%s' % out_msg)
+			sys.stdout.flush()
+			past_print=len(out_msg)+10
+			if done:
+				break
+			if func(obj) == False:
+				# we are done with this function. print the msg once again for completeness & then break
+				done = True
+				continue
+			time.sleep(interval)
+			self._check_and_abort()
+		print ' - Done'
+
+	def _wait_for_sn_to_go_down(self, sn):
+		rc, out, err = execute_cmd_by_subprocess(['ping', '-c', '1', sn['ip']], timeout=5)
+		return (rc == 0)
+
+	def _wait_for_sn_to_come_up(self, sn):
+		rc, out, err = execute_cmd_by_subprocess(['ping', '-c', '1', sn['ip']], timeout=5)
+		if rc == 0:
+			# if ping worked, try a sample ssh to make sure we are ok
+			rc, out, err = self.ssh_execute(sn['ip'], ['ls', '/tmp'], timeout=5)
+		return (rc != 0)
+
+	def _wait_for_cc_services_to_come_up(self, sn):
+		rc, out, err = self.ssh_execute(sn['ip'], ['/var/lib/zadara/scripts/sn/ha/get-ha-state'])
+		sn_role = 'unknown'
+		cc_active_is_available = False
+		if rc == 0:
+			for line in out.split("\n"):
+				role = line.split(":")[-1].strip()
+				if role == 'active':
+					cc_active_is_available = True
+				if sn['uname'].lower() in line:
+					sn_role = role
+		# if we dont have any CC as active, return back
+		if not cc_active_is_available:
+			return True
+		return (sn_role != 'active' and sn_role != 'standby')
+
+	def _wait_for_vsa_to_come_up_msg(self, vsa):
+		vsa_name = '[%s/%s]' % (vsa['name'], vsa['display_name'])
+		msg = "\t- %-40s - %s VPSA is in [%s] state." % (vsa_name, vsa['version'], vsa['status'])
+		if vsa['status'] != 'created' and vsa['status'] != 'failed':
+			return msg + " Waiting for it to come up"
+		else:
+			return msg
+
+	def _wait_for_vsa_to_come_up(self, vsa):
+		vsa['status'] = self.az_access.get_vsa_status(vsa['name'])
+		return (vsa['status'] != 'created' and vsa['status'] != 'failed' and vsa['status'] != 'deleted' and vsa['status'] != 'deleting')
+
+	def _wait_for_vsa_to_hibernate_msg(self, vsa):
+		vsa_name = '[%s/%s]' % (vsa['name'], vsa['display_name'])
+		msg = "\t- %-40s - %s VPSA is in [%s] state." % (vsa_name, vsa['version'], vsa['status'])
+		if vsa['status'] != 'hibernated' and vsa['status'] != 'hibernate_failed':
+			return msg + " Waiting for it to hibernate"
+		else:
+			return msg
+
+	def _wait_for_vsa_to_hibernate(self, vsa):
+		vsa['status'] = self.az_access.get_vsa_status(vsa['name'])
+		return (vsa['status'] != 'hibernated' and vsa['status'] != 'hibernate_failed')
+
+	def _wait_for_vsa_normal_upgrade_status_msg(self, args):
+		vsa=args['vsa']
+		vsa_name = '[%s/%s]' % (vsa['name'], vsa['display_name'])
+		msg = "\t- %-40s - %s VPSA! Redundancy Status = " % (vsa_name, vsa['version'])
+		if 'upgrade_status' in vsa:
+			if vsa['upgrade_status'] == 'Normal':
+				msg = msg + '[%s]' % vsa['upgrade_status']
+			else:
+				wait_status = ' - Waiting for Normal Status' if args['blocking_wait'] else ''
+				msg = msg + '[%s] (Reason:%s)%s' % (vsa['upgrade_status'], vsa['upgrade_status_reason'], wait_status)
+		else:
+			msg = msg + '[Fetching...]'
+		return msg
+
+	def _wait_for_vsa_normal_upgrade_status(self, args):
+		vsa=args['vsa']
+		vsa['upgrade_status'], vsa['upgrade_status_reason'] = self._get_vsa_upgrade_status(vsa)
+
+		# if its not a blocking-wait, just give up
+		if args['blocking_wait'] == False:
+			return False
+
+		# blocking-wait, wait till VPSA turns Normal
+		return vsa['upgrade_status'] != 'Normal'
+
+	def _wait_for_vsa_upgrade_to_complete_msg(self, args):
+		vsa=args['vsa']
+		upgrade_status=args['upgrade_status']
+
+		vsa_name = '[%s/%s]' % (vsa['name'], vsa['display_name'])
+		msg = "\t- %s - %s VPSA! Upgrade Status = [%s]/[%s]." % (vsa_name, vsa['version'], upgrade_status['status'], upgrade_status['message'])
+		if upgrade_status['status'] != 'done' and upgrade_status['status'] != 'error' and upgrade_status['status'] != 'aborted':
+			return msg + ' Waiting for Upgrade completion'
+		else:
+			return msg
+
+	def _wait_for_vsa_upgrade_to_complete(self, args):
+		action_id=args['action_id']
+		vsa=args['vsa']
+		settings=args['settings']
+
+		cmd = [VPSA_REQUESTS_PY, '--token', settings['SERVICE_TOKEN'], '--tenant', vsa['tenant_id'], '--vsa', vsa['name'], '--action', 'show_all']
+		if 'sn_ip' in args and args['sn_ip']:
+			rc, out, err = self.ssh_execute(args['sn_ip'], cmd)
+			if rc != 0:
+				# if we had a failure this time, try _run_on_active_cc next time
+				args['sn_ip'] = None
+		else:
+			rc, out, err, sn_ip = self._run_on_active_cc(settings, cmd, 'Checking VSA[%s] upgrade status' % vsa['name'])
+
+			# cache ccmaster IP, so that we can direct run SSH to ccmaster then on
+			if rc == 0:
+				args['sn_ip'] = sn_ip
+
+		if rc != 0:
+			return True
+
+		for line in out.split("\n"):
+			if action_id not in line:
+				continue
+
+			match_obj = re.match(r'.*(action_.*: )({.*})(.*)', line)
+			if not match_obj:
+				continue
+
+			action_id=match_obj.group(1).split()[0]
+			js = json.loads(match_obj.group(2).replace("\'", '"'))
+			if js['name'] != 'upgrade_version':
+				log(LOG_LEVEL_ERROR, 'ERROR: Logic error. %s expected with upgrade_version, but has [%s]' % (action_id, js['name']), console=True)
+				return True
+
+			args['upgrade_status'] = {'status':js['status']}
+			args['upgrade_status']['message'] = js['message'] if 'message' in js else ''
+
+			# if its a failure due to re-upgrading same image, consider it success
+			if js['status'] == 'error' and 'similar origin and target images' in args['upgrade_status']['message']:
+				args['upgrade_status'] = {'status':'done', 'message':'Already upgraded'}
+				return False
+
+			return (js['status'] != 'done' and js['status'] != 'error' and js['status'] != 'aborted')
+
+		return True
+
+	def _wait_for_cc_cluster_state_to_be_ok(self, args):
+		settings = args['settings']
+		sn = args['sn']
+		rc, out, err, sn_ip = self._run_on_active_cc(settings, [ZINSTALL,'--action',INT_REQ_GET_DRBD_STATE], 'get DRDD health status')
+		if rc != 0:
+			log(LOG_LEVEL_ERROR, "ERROR: Failed to get DRBD health of CC cluster! (rc:%d/err:%s)" % (rc, err))
+			return True
+
+		msg = json.loads(out.strip())
+		if msg['state'] != 'UpToDate/UpToDate':
+			# DRBD is not in sync. now we will allow upgrade if the SN being upgraded is the one that is having bad DRBD state
+			if sn['uname'] in msg:
+				peer_sn = settings['DRBD_CCSLAVE_HOSTNAME'] if settings['DRBD_CCMASTER_HOSTNAME'] == sn['uname'] else settings['DRBD_CCMASTER_HOSTNAME']
+				if msg[sn['uname']] == 'UpToDate' and msg[peer_sn] != 'UpToDate':
+					# peer state is not healthy. dont allow upgrade
+					return True
+				else:
+					# allow upgrade as peer CC is healthy
+					return False
+			else:
+				# DRBD state is not good to allow this SN's upgrade now
+				return True
+		else:
+			return False
+
+	def _reboot_sn_and_wait_for_bringup(self, settings, sn):
+		self._log_installer_sub_phase_start('Reboot SN[%s] and wait for it to come up' % sn['uname'])
+
+		rc, out, err = self.ssh_execute(sn['ip'], ['logger -t zinstall "installer-reboot";sudo reboot'])
+		self._do_waited_operation('_wait_for_sn_to_go_down', "\t- Wait for SN[%s] to go down" % sn['uname'], sn, interval=0.1)
+		self._do_waited_operation('_wait_for_sn_to_come_up', "\t- Wait for SN[%s] to come up" % sn['uname'], sn, interval=0.1)
+
+		self._log_installer_sub_phase_stop()
+		return 0
+
+
+	"""
+	Internal helper to load checkpoint
+	"""
+	def int_load_checkpoint(self, opts):
+		if not os.path.exists(CHECKPOINT_FILE):
+			print CHECKPOINT_FMT_STRING % (CHECKPOINT_EMPTY, 'install', 'all')
+		else:
+			with open(CHECKPOINT_FILE, "r") as checkpoint_file:
+				print checkpoint_file.read().strip()
+		return 0
+
+	"""
+	Internal helper to update checkpoint
+	"""
+	def int_update_checkpoint(self, opts):
+		f=open(CHECKPOINT_FILE, "w")
+		f.write(opts.checkpoint_input)
+		f.close()
+		return 0
+
+	def _update_checkpoint(self, sn, checkpoint, mode, component):
+		cmd = '%s --action %s --checkpoint_input %s' % (ZINSTALL, INT_REQ_UPDATE_CHECKPOINT, CHECKPOINT_FMT_STRING % (checkpoint, mode, component))
+		rc, out, err = self.ssh_execute(sn['ip'], [cmd])
+		return 0
+
+	def _load_checkpoint(self, sn):
+		rc, out, err = self.ssh_execute(sn['ip'], [ZINSTALL, '--action', INT_REQ_LOAD_CHECKPOINT])
+		if rc == 0:
+			split_str=out.strip().split('_')
+			return int(split_str[0]), split_str[1], split_str[2]
+		return CHECKPOINT_EMPTY, 'install', 'all'
+
+	def _wait_for_local_nova_api_bringup(self, sn):
+		rc, msg = euca_run_cmd('timeout 5 euca-describe-images')
+		return (rc != 0)
+
+	def _wait_for_ccvm_ini_to_be_setup(self, sn):
+		return not os.path.exists(CCVM_INI_FILE)
+
+	def _get_image_from_staging_dir(self, pkg, img_name_startswith):
+		staging_dir=os.path.join(ZPKGS_STAGING_DIR, opts.pkg)
+		for f in os.listdir(staging_dir):
+			if os.path.isdir(os.path.join(staging_dir, f)):
+				continue
+			if f.startswith(img_name_startswith) and pkg in f:
+				if f.endswith('.tgz') and os.path.exists(os.path.join(staging_dir, f.split('.tgz')[0])):
+					return os.path.join(staging_dir, f.split('.tgz')[0])
+				else:
+					return os.path.join(staging_dir, f)
+		return None
+
+	def _extract_and_register_image(self, opts, service_token, img_name_startswith):
+		staging_dir=os.path.join(ZPKGS_STAGING_DIR, opts.pkg)
+		pkg_file = self._get_image_from_staging_dir(opts.pkg, img_name_startswith)
+		if not pkg_file:
+			log(LOG_LEVEL_INFO, "\t- No [%s] VM image type in package! Not attempting register!" % img_name_startswith, console=True)
+			return 0
+
+		image_name = pkg_file.split("/")[-1]
+		if pkg_file.endswith('.tgz'):
+			image_name = image_name.split('.tgz')[0]
+
+		rc, msg = euca_run_cmd('euca-describe-images %s' % image_name)
+		if rc == 0:
+			log(LOG_LEVEL_INFO, "\t- Image[%s] is already available in Glance! Not registering it" % image_name, console=True)
+			return 0
+
+		if pkg_file.endswith('.tgz'):
+			log(LOG_LEVEL_INFO, "\t- Extracting image[%s]" % image_name, console=True)
+			local_execute_cmd('cd %s/%s;tar -xvzf %s;cd -' % (ZPKGS_STAGING_DIR, opts.pkg, pkg_file))
+			pkg_file = pkg_file.split('.tgz')[0]
+
+		log(LOG_LEVEL_INFO, "\t- Registering image[%s] in Glance" % image_name, console=True)
+		cmd='glance add name="%s" is_public=True disk_format="raw" container_format="bare" --can-share -A %s < %s' % (image_name, service_token, pkg_file)
+		rc, msg = local_execute_cmd(cmd)
+		if rc != 0:
+			return -1
+		return 0
+
+	def int_register_imgs_in_glance(self, opts):
+		self._do_waited_operation('_wait_for_local_nova_api_bringup', "\t- Wait for nova-api to come up", obj=None, interval=1)
+
+		settings = self.load_settings()
+		rc = self._extract_and_register_image(opts, settings['SERVICE_TOKEN'], 'vc')
+		if rc == 0:
+			rc = self._extract_and_register_image(opts, settings['SERVICE_TOKEN'], 'ccvm')
+		return rc
+
+	def _register_images_in_glance(self, sn, pkg_coords):
+		self._log_installer_sub_phase_start('Registering VC/CC images for [%s] in Glance' % pkg_coords['pkg'])
+		rc, out, err = self.ssh_execute(sn['ip'], [ZINSTALL, '--action', INT_REQ_REGISTER_IMGS_IN_GLANCE, '--pkg', pkg_coords['pkg']], print_stdout=True)
+		if rc == 0:
+			log(LOG_LEVEL_INFO, "Successfully registered packages in glance")
+		else:
+			log(LOG_LEVEL_ERROR, "ERROR: Failed to register images in glance (rc:%d/err:%s)" % (rc, err), console=True)
+		self._log_installer_sub_phase_stop()
+		return rc
+
+	def _get_ccvm_mgmt_ip(self):
+		rc, msg = local_execute_cmd('/var/lib/zadara/scripts/sn/ha/ccvm-control --get_ccvm_instance')
+		if rc != 0 or 'CCVM instance' not in msg:
+			return None
+		match_obj = re.match(r'.*\[MGMT IP:(.*)\].*(\[HB IP:.*\]).*', msg.strip())
+		return match_obj.group(1).strip()
+
+	def _set_ccvm_default_vc_image(self, pkg_coords):
+		self._log_installer_sub_phase_start('Set VC default image for [%s] in CCVM' % pkg_coords['pkg'])
+
+		images = self._get_image_name_from_pkg_coords(pkg_coords, ['vc'])
+		if 'vc' not in images:
+			log(LOG_LEVEL_INFO, "\t- No VC image in package. Not setting default image", console=True)
+			self._log_installer_sub_phase_stop()
+			return
+
+		vc_image = images['vc']
+		ccvm_mgmt_ip = self._get_ccvm_mgmt_ip()
+		if not ccvm_mgmt_ip:
+			log(LOG_LEVEL_INFO, "\t- Cant get CCVM Management IP. Not setting default VC Image!", console=True)
+			self._log_installer_sub_phase_stop()
+			return
+
+		rc, out, err = self.ssh_execute(ccvm_mgmt_ip, ['/var/lib/zadara/scripts/ccvm/zadara_ccvmreq.py','image', 'set_default', '--image', vc_image], port="2022")
+		if rc == 0:
+			log(LOG_LEVEL_INFO, "\t- Successfully set VC default image as [%s] in CCVM" % vc_image, console=True)
+		else:
+			log(LOG_LEVEL_INFO, "Failed to set VC default image as [%s] in CCVM (rc:%d out:%s err:%s)!" % (vc_image, rc, out, err))
+			log(LOG_LEVEL_INFO, "\t- Failed to set VC default image as [%s] in CCVM. Ignore and continuing!" % vc_image, console=True)
+		self._log_installer_sub_phase_stop()
+		return
+	
+	def int_setup_ccvm(self, opts):
+		self._do_waited_operation('_wait_for_local_nova_api_bringup', "\t- Wait for nova-api to come up", obj=None, interval=1)
+
+		if opts.image_name:
+			# if an image_name is passed, use it up
+			image_name = opts.image_name
+		else:
+			# get the CCVM image name from the staging area
+			staging_dir=os.path.join(ZPKGS_STAGING_DIR, opts.pkg)
+			pkg_file = self._get_image_from_staging_dir(opts.pkg, 'ccvm')
+			if not pkg_file:
+				log(LOG_LEVEL_INFO, "\t- No CCVM image available in package. Not setting up CCVM!", console=True)
+				return 0
+
+			image_name = pkg_file.split("/")[-1]
+			if image_name.endswith('.tgz'):
+				image_name = image_name.split('.tgz')[0]
+
+		self._do_waited_operation('_wait_for_ccvm_ini_to_be_setup', "\t- Wait for CCVM initialization file to be setup", obj=None, interval=1)
+		config = ConfigParser.ConfigParser()
+		config.read(CCVM_INI_FILE)
+		config.set('CCVM','image', image_name)
+
+		# update the CCVM ini file with ccvm image name
+		new_ccvm_ini_file='/tmp/ccvm.ini.%d' % random.randint(0,10000)
+		f=open(new_ccvm_ini_file, "w")
+		config.write(f)
+		f.close()
+		local_execute_cmd('mv %s %s' % (new_ccvm_ini_file, CCVM_INI_FILE))
+
+		# restart CCVM resource
+		log(LOG_LEVEL_INFO, '\t- Re-Starting CCVM', console=True)
+		rc, msg = local_execute_cmd('crm resource restart CCVM')
+		return rc
+
+	"""
+	Helper to create support ticket
+	"""
+	def int_create_support_ticket(self, opts):
+		sys.path.append('/var/lib/zadara/scripts/utils/')
+		try:
+			zadara_zendesk_tix = __import__('zadara_zendesk_tix')
+
+			ticket_priorities = {}
+			ticket_priorities['TICKET_PRIORITY_LOW'] = zadara_zendesk_tix.TICKET_PRIORITY_LOW
+			ticket_priorities['TICKET_PRIORITY_NORMAL'] = zadara_zendesk_tix.TICKET_PRIORITY_NORMAL
+			ticket_priorities['TICKET_PRIORITY_HIGH'] = zadara_zendesk_tix.TICKET_PRIORITY_HIGH
+			ticket_priorities['TICKET_PRIORITY_URGENT'] = zadara_zendesk_tix.TICKET_PRIORITY_URGENT
+			ticket_priority = ticket_priorities[opts.ticket_priority]
+
+			zadara_zendesk_tix.create_support_ticket(opts.ticket_msgid, json.loads(opts.ticket_args), ticket_priority, 'no', no_print=True)
+		except Exception as e:
+			log(LOG_LEVEL_WARN, "Failed to create support ticket:%s" % e)
+			pass
+		return 0
+
+	"""
+	SN Install completion support ticket
+	"""
+	def _create_sn_install_complete_ticket(self, sn, rc):
+		if rc == 0:
+			status='Success'
+			statusmsg= 'SN Installation Complete!'
+			ticket_priority = 'TICKET_PRIORITY_LOW'
+		else:
+			status='Failed'
+			statusmsg= 'SN Installation Failed! Please contact Zadara Support! (Msg:%s)' % log_get_last_error()
+			ticket_priority = 'TICKET_PRIORITY_HIGH'
+		self.ssh_execute(sn['ip'], [ZINSTALL, '--action', INT_REQ_CREATE_SUPPORT_TICKET, '--ticket_msgid', 'TICKET_ZINSTALL_OP_COMPLETE', '--ticket_priority', ticket_priority, '--ticket_args', "'%s'" % json.dumps(['SN', sn['uname'], 'Install', status, statusmsg])])
+		return 0
+
+	"""
+	SN Upgrade completion support ticket
+	"""
+	def _create_cloud_upgrade_complete_ticket(self, env_name, pkg, status, statusmsg):
+		opts = OptObj()
+		opts.ticket_msgid = 'TICKET_ZINSTALL_OP_COMPLETE'
+		opts.ticket_args = json.dumps(['Cloud', env_name, 'Upgrade to [%s]' % pkg, status, statusmsg])
+		opts.ticket_priority = 'TICKET_PRIORITY_LOW' if status == 'Success' else 'TICKET_PRIORITY_HIGH'
+		self.int_create_support_ticket(opts)
+		return 0
+
+	"""
+	Performs the install steps
+	"""
+	def _perform_install(self, settings, sn, pkg_coords):
+		self._log_installer_phase_start('Starting installation on [%s] with role[%s]' % (sn['uname'], sn['role']))
+
+		# if we are installing ccmaster & ccslave is active, force this install as ccslave install
+		forced_role=None
+		if sn['role'] == 'ccmaster':
+			sn_uname = self._get_sn_uname_by_role(settings, 'ccslave')
+			fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, sn_uname)
+			status, nova_version, sn_version, installer_version = self._get_sn_status(sn_uname, extmgmt_ip)
+			if status == 'connected' and self._get_current_sn_role({'uname':sn_uname, 'ip':extmgmt_ip}) == 'active':
+				forced_role='ccslave'
+				log(LOG_LEVEL_INFO, "\t- Forcing install mode to [cclsave] as sn[%s] is running as [ccmaster]" % sn_uname, console=True)
+
+		rc = 0
+		checkpoint, mode, component = self._load_checkpoint(sn)
+		if checkpoint != CHECKPOINT_EMPTY:
+			if checkpoint >= CHECKPOINT_SN_INSTALL_COMPLETE:
+				log(LOG_LEVEL_INFO, '\t- Installer detected SN installation is fully complete on [%s]!' % sn['uname'], console=True)
+				self._log_installer_phase_stop()
+				return 0
+
+			log(LOG_LEVEL_INFO, "\t- Installer detected previous [%s:%s] had completed till [%s] phase. Continuing from there!" % (mode, component, checkpoint_str[checkpoint]), console=True)
+
+		if checkpoint < CHECKPOINT_INTF_RENAMED:
+			rc = self._install_step1_test_internet_access_on_sn(settings, sn)
+			if rc == 0:
+				rc = self._install_step2_rename_network_intfs(settings, sn)
+
+			# update checkpoint of progress
+			if rc == 0:
+				self._update_checkpoint(sn, CHECKPOINT_INTF_RENAMED, 'install', 'all')
+
+		if rc == 0:
+			rc = self._stage_packages_for_install(settings, sn, pkg_coords, 'Install')
+
+		if checkpoint < CHECKPOINT_SRIOV_INSTALL:
+			# SRIOV install & reboot
+			if rc == 0:
+				rc = self._run_zadara_installsh_on_sn(settings, sn, pkg_coords, 'install', 'sriov', forced_role)
+
+			if rc == 0:
+				rc = self._reboot_sn_and_wait_for_bringup(settings, sn)
+
+			# update checkpoint of progress
+			if rc == 0:
+				self._update_checkpoint(sn, CHECKPOINT_SRIOV_INSTALL, 'install', 'all')
+
+
+		if checkpoint < CHECKPOINT_NETWORK_INSTALL:
+			# network install & reboot
+			if rc == 0:
+				rc = self._run_zadara_installsh_on_sn(settings, sn, pkg_coords, 'install', 'network', forced_role)
+
+			if rc == 0:
+				rc = self._reboot_sn_and_wait_for_bringup(settings, sn)
+
+			# update checkpoint of progress
+			if rc == 0:
+				self._update_checkpoint(sn, CHECKPOINT_NETWORK_INSTALL, 'install', 'all')
+
+		if checkpoint < CHECKPOINT_INSTALL_COMPLETE:
+			if (rc == 0) and (sn['role'] == 'ccmaster' or sn['role'] == 'ccslave'):
+				rc = self._create_drbd_settings_on_sn(settings, sn)
+
+			# full install
+			if rc == 0:
+				rc = self._run_zadara_installsh_on_sn(settings, sn, pkg_coords, 'install', forced_role=forced_role)
+
+			# update checkpoint of progress
+			if rc == 0:
+				self._update_checkpoint(sn, CHECKPOINT_INSTALL_COMPLETE, 'install', 'all')
+
+
+		if sn['role'] == 'ccmaster' or sn['role'] == 'ccslave':
+			# if we are installing ccmaster or ccslave wait for CC-HA services to come up before continuing
+			if rc == 0:
+				self._log_installer_sub_phase_start('Wait for CC services bringup')
+				self._do_waited_operation('_wait_for_cc_services_to_come_up', "\t- Wait for SN[%s] CC services to come up" % sn['uname'], sn, interval=1)
+				self._log_installer_sub_phase_stop()
+
+		sn_role = self._get_current_sn_role(sn)
+
+		# if this is the ccmaster, switch over package-repo on the first install
+		if sn_role == 'active' and (checkpoint < CHECKPOINT_CCMASTER_REPO_SWITCH):
+			# switchover the S3 local repo on ccmaster to the DRBD partition
+			if rc == 0:
+				self._log_installer_sub_phase_start('Switching over package download-repo')
+				rc, out, err = self.ssh_execute(sn['ip'], [ZINSTALL, '--action', INT_REQ_SWITCHOVER_REPO_DIR], print_stdout=True)
+				if rc != 0:
+					log(LOG_LEVEL_ERROR, 'ERROR: Failed to switch-over package download-repo directory on sn[%s]' % sn['uname'], console=True)
+				self._log_installer_sub_phase_stop()
+
+			# update checkpoint of progress
+			if rc == 0:
+				self._update_checkpoint(sn, CHECKPOINT_CCMASTER_REPO_SWITCH, 'install', 'all')
+
+		if sn_role == 'active' and (checkpoint < CHECKPOINT_CCMASTER_REGISTER_IMGS):
+			# register vc & ccvm images in glance
+			if rc == 0:
+				rc = self._register_images_in_glance(sn, pkg_coords)
+
+			# update checkpoint of progress
+			if rc == 0:
+				self._set_ccvm_default_vc_image(pkg_coords)
+				self._update_checkpoint(sn, CHECKPOINT_CCMASTER_REGISTER_IMGS, 'install', 'all')
+
+		if sn_role == 'active' and (checkpoint < CHECKPOINT_CCMASTER_SETUP_CCVM):
+			if rc == 0:
+				self._log_installer_sub_phase_start('Setup CCVM')
+				rc, out, err = self.ssh_execute(sn['ip'], [ZINSTALL, '--action', INT_REQ_SETUP_CCVM, '--pkg', pkg_coords['pkg']], print_stdout=True)
+				if rc != 0:
+					log(LOG_LEVEL_ERROR, 'ERROR: Failed to setup CCVM on [%s]' % sn['uname'], console=True)
+				self._log_installer_sub_phase_stop()
+
+			# update checkpoint of progress
+			if rc == 0:
+				self._update_checkpoint(sn, CHECKPOINT_CCMASTER_SETUP_CCVM, 'install', 'all')
+
+		# Raise support ticket indicating success/failure of install
+		self._create_sn_install_complete_ticket(sn, rc)
+
+		# De-stage packages that were staged and wrap-up the install
+		if rc == 0:
+			self._update_checkpoint(sn, CHECKPOINT_SN_INSTALL_COMPLETE, 'install', 'all')
+			self._destage_packages_after_install(settings, sn, pkg_coords, 'Install')
+			self._log_installer_phase_stop()
+		return rc
+
+	def _parse_sn_role(self, rc, sn_uname, out):
+		if rc == 0:
+			for line in out.split("\n"):
+				if sn_uname.lower() in line:
+					return line.split(":")[-1].strip()
+		return 'unknown'
+
+	def _get_current_sn_role(self, sn):
+		rc, out, err = self.ssh_execute(sn['ip'], ['/var/lib/zadara/scripts/sn/ha/get-ha-state'])
+		return self._parse_sn_role(rc, sn['uname'], out)
+
+	def _get_local_sn_role(self):
+		rc, out, err = execute_cmd_by_subprocess(['/var/lib/zadara/scripts/sn/ha/get-ha-state'])
+		return self._parse_sn_role(rc, os.uname()[1], out)
+
+	def int_get_drbd_state(self, opts):
+		settings = self.load_settings()
+		rc, msg = local_execute_cmd('drbdadm dstate drbd0')
+		if rc != 0 or "/" not in msg:
+			log(LOG_LEVEL_ERROR, "Failed to get drbd status. (rc:%d/msg:%s)" % (rc, msg))
+			sys.stderr.write(err)
+			return rc
+
+		parts=msg.strip().split("/")
+		this_sn=os.uname()[1]
+		peer_sn = settings['DRBD_CCSLAVE_HOSTNAME'] if settings['DRBD_CCMASTER_HOSTNAME'] == this_sn else settings['DRBD_CCMASTER_HOSTNAME']
+		print json.dumps({'state':msg.strip(), this_sn:parts[0], peer_sn:parts[1]})
+		return 0
+
+	def _check_cc_cluster_state_for_sn_upgrade(self, settings, sn):
+		rc, out, err, sn_ip = self._run_on_active_cc(settings, [ZINSTALL,'--action',INT_REQ_GET_DRBD_STATE], 'get DRDD health status')
+		if rc != 0:
+			log(LOG_LEVEL_ERROR, "ERROR: Failed to get DRBD health of CC cluster! (rc:%d/err:%s)" % (rc, err), console=True)
+			return rc
+
+		msg = json.loads(out.strip())
+		if msg['state'] != 'UpToDate/UpToDate':
+			# DRBD is not in sync. now we will allow upgrade if the SN being upgraded is the one that is having bad DRBD state
+			if sn['uname'] in msg:
+				peer_sn = settings['DRBD_CCSLAVE_HOSTNAME'] if settings['DRBD_CCMASTER_HOSTNAME'] == sn['uname'] else settings['DRBD_CCMASTER_HOSTNAME']
+				if msg[sn['uname']] == 'UpToDate' and msg[peer_sn] != 'UpToDate':
+					log(LOG_LEVEL_ERROR, 'ERROR: Attempting upgrade on CC[%s][drbd_state:%s] when peer CC[%s][drbd_state:%s] is not healthy' % (sn['uname'], msg[sn['uname']], peer_sn, msg[peer_sn]), console=True)
+					return -1
+				else:
+					log(LOG_LEVEL_INFO, '\t- Allowing this CC[%s][drbd_state:%s] upgrade as peer CC[%s][drbd_state:%s] is healthy!' % (sn['uname'], msg[sn['uname']], peer_sn, msg[peer_sn]), console=True)
+			else:
+				log(LOG_LEVEL_ERROR, "ERROR: DRBD health of CC cluster is [%s]! Cannot perform upgrade!" % msg['state'], console=True)
+				return -1
+		return 0
+
+	def _drbd_state_precheck_for_sn_upgrade(self, settings, sn, wait_on_drbd_state):
+		if wait_on_drbd_state:
+			self._log_installer_sub_phase_start('Wait for CC Cluster State to be ok before doing SN upgrade')
+			self._do_waited_operation('_wait_for_cc_cluster_state_to_be_ok', msg='\t- Wait for CC Cluster State to be OK', obj={'settings':settings, 'sn':sn}, interval=1)
+			rc = 0
+		else:
+			self._log_installer_sub_phase_start('Checking CC Cluster State to check if SN upgrades are allowed')
+			rc = self._check_cc_cluster_state_for_sn_upgrade(settings, sn)
+		self._log_installer_sub_phase_stop()
+		return rc
+
+	"""
+	Performs the upgrade steps
+	"""
+	def _perform_upgrade(self, settings, sn, pkg_coords, wait_on_drbd_state):
+		self._log_installer_phase_start('Starting upgrade on [%s] with role[%s]' % (sn['uname'], sn['role']))
+
+		# do one round of DRBD health check before continuing
+		rc = self._drbd_state_precheck_for_sn_upgrade(settings, sn, wait_on_drbd_state)
+		if rc != 0:
+			return rc
+
+		rc = 0
+		checkpoint, mode, component = self._load_checkpoint(sn)
+		if checkpoint != CHECKPOINT_EMPTY:
+			if checkpoint < CHECKPOINT_SN_INSTALL_COMPLETE:
+				log(LOG_LEVEL_ERROR, '\t- Installer detected SN installation is not fully complete on [%s]! Cannot continue!' % sn['uname'], console=True)
+				return -1
+
+		rc = self._stage_packages_for_install(settings, sn, pkg_coords, 'Upgrade')
+
+		# If this is the active CC, then first regiter new VC/CC images in glance before doing the upgrade
+		current_sn_role = self._get_current_sn_role(sn)
+		if current_sn_role == 'active' and (checkpoint < CHECKPOINT_SN_UPGRADE_REGISTER_IMGS):
+			# register vc & ccvm images in glance
+			if rc == 0:
+				rc = self._register_images_in_glance(sn, pkg_coords)
+
+			# update checkpoint of progress
+			if rc == 0:
+				self._set_ccvm_default_vc_image(pkg_coords)
+				self._update_checkpoint(sn, CHECKPOINT_SN_UPGRADE_REGISTER_IMGS, 'upgrade', 'all')
+
+		if checkpoint < CHECKPOINT_SN_UPGRADE_COMPLETE:
+			# Ensure DRBD settings
+			if rc == 0:
+				if sn['role'] == 'ccmaster' or sn['role'] == 'ccslave':
+					self._log_installer_sub_phase_start('Creating DRBD configuration on SN[%s]' % sn['uname'])
+					rc = self._create_drbd_settings_on_sn(settings, sn)
+					if rc == 0:
+						self._log_installer_sub_phase_stop()
+
+			# upgrade SN
+			if rc == 0:
+				self._log_installer_sub_phase_start('Performing SN Upgrade')
+
+				rc = self._run_zadara_installsh_on_sn(settings, sn, pkg_coords, 'update')
+				if rc == 0:
+					self._log_installer_sub_phase_stop()
+
+			# update checkpoint of progress
+			if rc == 0:
+				self._update_checkpoint(sn, CHECKPOINT_SN_UPGRADE_COMPLETE, 'upgrade', 'all')
+
+		# De-stage packages that were staged and wrap-up the upgrade
+		if rc == 0:
+			self._update_checkpoint(sn, CHECKPOINT_SN_INSTALL_COMPLETE, 'upgrade', 'all')
+			self._destage_packages_after_install(settings, sn, pkg_coords, 'Upgrade')
+			self._log_installer_phase_stop()
+		return rc
+
+	def _do_package_validation_checks_and_get_coords(self, opts, settings):
+		rc, out, err, ccmaster_ip = self._run_on_active_cc(settings, [ZINSTALL, '--action', INT_REQ_GET_PACKAGE_DETAILS, '--local_package_list'], 'get package listing')
+		if rc != 0:
+			log(LOG_LEVEL_ERROR, 'ERROR: Cannot determine list of downloaded packages at ccmaster', console=True)
+			return {}
+
+		pkgs = json.loads(out)
+		if opts.pkg not in pkgs['pkgs']:
+			log(LOG_LEVEL_ERROR, 'ERROR: Cant find fully downloaded package[%s] at ccmaster. Available packages[%s]' % (opts.pkg, pkgs['pkgs']), console=True)
+			return None
+		return {'ccmaster_ip':ccmaster_ip, 'pkg_repo':pkgs['pkg_repo'], 'pkg':opts.pkg}
+
+	"""
+	Install ccmaster/ccslave pair
+	"""
+	def ext_cc_install(self, opts):
+		if not opts.pkg:
+			log(LOG_LEVEL_ERROR, 'ERROR: It is mandatory to specify package version for cc_install!', console=True)
+			return -1
+
+		settings=self.load_settings()
+		pkg_coords = self._do_package_validation_checks_and_get_coords(opts, settings)
+		if not pkg_coords:
+			return -1
+
+		sns=[]
+
+		# add a record for ccmaster
+		sn_uname = self._get_sn_uname_by_role(settings, 'ccmaster')
+		fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, sn_uname)
+		sns.append({'ip':extmgmt_ip, 'role':'ccmaster', 'uname':sn_uname})
+
+		# add a record for ccslave
+		sn_uname = self._get_sn_uname_by_role(settings, 'ccslave')
+		fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, sn_uname)
+		sns.append({'ip':extmgmt_ip, 'role':'ccslave', 'uname':sn_uname})
+
+		# prevent cc-install to be triggered from ccmaster/ccslave
+		this_sn_uname=os.uname()[1]
+		if this_sn_uname == sns[0]['uname'] or this_sn_uname == sns[1]['uname']:
+			all_sn_unames=self._get_all_sn_unames(settings)
+			all_sn_unames=list(filter((sns[0]['uname']).__ne__, all_sn_unames))
+			all_sn_unames=list(filter((sns[1]['uname']).__ne__, all_sn_unames))
+			log(LOG_LEVEL_ERROR, 'ERROR: CC-Install must be triggered from a third SN that is not the ccmaster/ccslave. Possible options[%s]' % all_sn_unames, console=True)
+			return -1
+
+		# First validate CCMaster <> CCSlave networking
+		rc = self._update_and_check_networking(settings, sns)
+		if rc != 0:
+			return rc
+
+		# Trigger ccmaster installation
+		rc = self._perform_install(settings, sns[0], pkg_coords)
+
+		# if ccmaster install went through fine, go ahead with ccslave
+		if rc == 0:
+			# get the package co-ordinates again as CCMaster install did a package co-ordinates change-over
+			pkg_coords = self._do_package_validation_checks_and_get_coords(opts, settings)
+
+			rc = self._perform_install(settings, sns[1], pkg_coords)
+
+		return rc
+
+	"""
+	Check Networking
+	"""
+	def ext_check_networking(self, opts):
+		settings=self.load_settings()
+		all_sn_unames=self._get_all_sn_unames(settings)
+
+		# if user has specified sn-unames use them as the list to check-networking
+		if opts.sn_uname:
+			sn_unames = opts.sn_uname.split(",")
+
+			if len(sn_unames) < 2:
+				log(LOG_LEVEL_ERROR, 'ERROR: At least 2 SNs must be specified for checking networking!\n', console=True)
+				return -1
+
+			for sn_uname in sn_unames:
+				if sn_uname not in all_sn_unames:
+					log(LOG_LEVEL_ERROR, 'ERROR: Invalid SN [%s] specified! Not configured in settings!' % sn_uname, console=True)
+					log(LOG_LEVEL_ERROR, '\nConfigured SNs in settings are %s\n' % all_sn_unames, console=True)
+					return -1
+		else:
+			# do network check across all SNs
+			sn_unames = all_sn_unames
+
+		sns=[]
+		for sn_uname in sn_unames:
+			fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, sn_uname)
+			if not extmgmt_ip:
+				log(LOG_LEVEL_ERROR, 'ERROR: Cannot get External Mgmt IP for sn[%s]!' % sn_uname, console=True)
+				return -1
+
+			sns.append({'ip':extmgmt_ip, 'role':self._get_role_for_sn(settings, sn_uname), 'uname':sn_uname})
+
+		return self._update_and_check_networking(settings, sns)
+
+	"""
+	Install new SN
+	"""
+	def ext_sn_install(self, opts):
+		settings = self.load_settings()
+		rc, pkg_coords, extmgmt_ip = self._perform_sn_install_upgrade_checks(opts, settings)
+		if rc != 0:
+			return rc
+
+		# prevent sn-install to be triggered from same SN
+		if os.uname()[1] == opts.sn_uname:
+			all_sn_unames=self._get_all_sn_unames(settings)
+			all_sn_unames=list(filter((opts.sn_uname).__ne__, all_sn_unames))
+			log(LOG_LEVEL_ERROR, 'ERROR: SN-Install must be triggered from a different SN than the one that is to be installed! Possible options[%s]' % all_sn_unames, console=True)
+			return -1
+
+		sns=[]
+		sns.append({'ip':extmgmt_ip, 'role':self._get_role_for_sn(settings, opts.sn_uname), 'uname':opts.sn_uname})
+
+		# add a record for ccmaster so that network validations happen against it
+		role='ccmaster'
+		sn_uname = self._get_sn_uname_by_role(settings, role)
+		if sn_uname == opts.sn_uname:
+			# If user is trying a SN install against ccmaster, use ccslave for network validations
+			role='ccslave'
+			sn_uname = self._get_sn_uname_by_role(settings, role)
+
+		fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, sn_uname)
+		sns.append({'ip':extmgmt_ip, 'role':role, 'uname':sn_uname})
+
+		# First validate SN <> CCMaster networking
+		rc = self._update_and_check_networking(settings, sns)
+		if rc != 0:
+			return rc
+
+		# Trigger SN installation
+		return self._perform_install(settings, sns[0], pkg_coords)
+
+	def _perform_sn_install_upgrade_checks(self, opts, settings):
+		if not opts.pkg:
+			log(LOG_LEVEL_ERROR, 'ERROR: It is mandatory to specify package version for %s!' % opts.action, console=True)
+			return -1, None, None
+
+		if not opts.sn_uname or ',' in opts.sn_uname:
+			log(LOG_LEVEL_ERROR, 'ERROR: It is mandatory to specify exactly one sn_uname for %s!' % opts.action, console=True)
+			return -1, None, None
+
+		pkg_coords = self._do_package_validation_checks_and_get_coords(opts, settings)
+		if not pkg_coords:
+			return -1, None, None
+
+		fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, opts.sn_uname)
+		if not extmgmt_ip:
+			log(LOG_LEVEL_ERROR, 'ERROR: Cannot get External Mgmt IP for sn[%s]!' % opts.sn_uname, console=True)
+			return -1, None, None
+
+		return 0, pkg_coords, extmgmt_ip
+
+	"""
+	Upgrade SN
+	"""
+	def ext_sn_upgrade(self, opts):
+		settings = self.load_settings()
+		rc, pkg_coords, extmgmt_ip = self._perform_sn_install_upgrade_checks(opts, settings)
+		if rc != 0:
+			return rc
+
+		# Trigger SN upgrade
+		return self.perform_sn_upgrade_with_vpsa_checks(opts, settings, opts.sn_uname)
+
+	def _run_on_active_cc(self, settings, cmd, msg, ssh_print_stdout=False):
+		local_sn_uname = os.uname()[1]
+
+		# short circuit for CCVM run. Dont bother to locate the CCmaster through ssh. its time consuming
+		# just go over Floating-ip channel
+		if local_sn_uname.startswith('ccvm-'):
+			rc, out, err = self.ssh_execute(settings['CCHA_FLOATIP_PRY'], cmd, print_stdout=ssh_print_stdout)
+			return rc, out, err, settings['CCHA_FLOATIP_PRY']
+
+		if self._get_local_sn_role() == 'active':
+			# quick optimization. If we are running on ccmaster, just execute locally
+			fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, local_sn_uname)
+			rc, out, err = execute_cmd_by_subprocess(cmd, print_stdout=ssh_print_stdout)
+			return rc, out, err, extmgmt_ip
+
+		states = {}
+		for role in ['ccmaster','ccslave']:
+			state={}
+			state['sn_uname'] = self._get_sn_uname_by_role(settings, role)
+
+			state['fe_ip'], state['be_ip'], state['mgmt_ip'], state['extmgmt_ip'] = self._get_ip_for_sn(settings, state['sn_uname'])
+			state['status'], state['nova_version'], sn_version, installer_version = self._get_sn_status(state['sn_uname'], state['extmgmt_ip'])
+			state['cc_state'] = 'dont-care'
+
+			if state['status'] != 'connected':
+				continue
+
+			# if s/w is not installed or s/w is installed & not operational or really this sn is ccmaster, use it up as ccmaster
+			sn_is_ccmaster=True
+			if state['nova_version'] != 'unknown':
+				rc, out, err = self.ssh_execute(state['extmgmt_ip'], ['/var/lib/zadara/scripts/sn/ha/get-ha-state'])
+				if rc == 0:
+					for line in out.split("\n"):
+						if 'THIS CC' in line and state['sn_uname'].lower() in line and line.split(":")[-1].strip() != 'active':
+							sn_is_ccmaster=False
+							break
+				elif (out and 'Cluster Resource Manager is not running' in out.strip()):
+					sn_is_ccmaster=False
+				elif (out and 'command not found' in out.strip()):
+					state['cc_state'] = 'not-installed'
+			else:
+				state['cc_state'] = 'not-installed'
+
+			states[role] = state
+			if not sn_is_ccmaster or state['cc_state'] == 'not-installed':
+				continue
+
+			rc, out, err = self.ssh_execute(state['extmgmt_ip'], cmd, print_stdout=ssh_print_stdout)
+			return rc, out, err, state['extmgmt_ip']
+
+		if 'ccmaster' in states and states['ccmaster']['cc_state'] == 'not-installed' and 'ccslave' in states and states['ccslave']['cc_state'] == 'not-installed':
+			# if both ccmaster & ccslave are not installed, then use the designated ccmaster as the SN to run the command
+			rc, out, err = self.ssh_execute(states['ccmaster']['extmgmt_ip'], cmd, print_stdout=ssh_print_stdout)
+			return rc, out, err, states['ccmaster']['extmgmt_ip']
+
+		log(LOG_LEVEL_ERROR, 'Both ccmaster/ccslave nodes are not connected! Cant %s!' % msg)
+		return -1, None, "Both ccmaster/ccslave not connected!", None
+
+	"""
+	Internal helper to download package
+	"""
+	def __int_download_pkg(self, opts):
+		repo = opts.remote_repo if opts.remote_repo else ZADARA_S3_PUBLIC_REPO
+
+		if repo.startswith('s3:'):
+			rc = self._ensure_s3cmd_setup()
+			if rc != 0:
+				print 'ERROR: Cannot have s3cmd package setup!'
+				return -1
+
+		pkg_repo, local_pkgs, local_partial_pkgs = self._list_local_pkgs()
+		if opts.pkg in local_pkgs:
+			log(LOG_LEVEL_INFO, 'Package[%s] is already downloaded & available for install!' % opts.pkg, console=True)
+			return 0
+
+		if opts.pkg not in local_partial_pkgs and len(local_pkgs) >= 5:
+			self.__delete_oldest_package(pkg_repo, local_pkgs)
+
+		pkg_dir=os.path.join(pkg_repo, opts.pkg)
+
+		if opts.pkg in local_partial_pkgs:
+			log(LOG_LEVEL_INFO, 'Removing partially downloaded package[%s] and attempting fresh download!' % opts.pkg, console=True)
+			local_execute_cmd('rm -rf %s' % pkg_dir)
+
+		if not os.path.exists(pkg_dir):
+			os.mkdir(pkg_dir)
+
+		if repo.startswith('s3:'):
+			# for S3 based repo use s3cmd to pull the contents in
+			if not repo.endswith("/"):
+				repo = "%s/" % repo
+			s3_pkgs = self._list_s3_pkgs(opts)
+			if opts.pkg in s3_pkgs:
+				# package repo contains pkg, download it
+				rc, out, err = execute_cmd_by_subprocess(['s3cmd', '--config', get_s3cfg_file(), '--force', '--recursive', '--progress', '--verbose', 'get', '%s%s/' % (repo, opts.pkg), pkg_dir], print_stdout=True)
+			else:
+				rc = -1
+				err = 'Package not available in [%s]' % repo
+				if self.progress_notify_func:
+					self.progress_notify_func(self.progress_notify_ctx, err)
+		else:
+			# for remote machine reachable directory, use the scp way
+			rc, out, err = self.scp_execute('zadmin@%s/*' % repo, pkg_dir, print_stdout=True)
+
+		if rc == 0:
+			local_execute_cmd('touch %s/.complete' % pkg_dir)
+			log(LOG_LEVEL_ERROR, "Successfully downloaded all components of package[%s]" % opts.pkg, console=True)
+		else:
+			msg = "Failed to download S3 package:%s" % err
+			log(LOG_LEVEL_ERROR, msg, console=True)
+			if self.progress_notify_func:
+				self.progress_notify_func(self.progress_notify_ctx, msg)
+		return rc
+
+	"""
+	Internal helper to delete oldest package
+	"""
+	def __delete_oldest_package(self, pkg_repo, local_pkgs):
+		oldest_pkg = None
+		for pkg in local_pkgs:
+			if oldest_pkg is None:
+				oldest_pkg = pkg
+			else:
+				pkg_mtime = datetime.datetime.fromtimestamp(os.stat('%s/%s' % (pkg_repo, pkg)).st_mtime)
+				oldest_pkg_mtime = datetime.datetime.fromtimestamp(os.stat('%s/%s' % (pkg_repo, oldest_pkg)).st_mtime)
+				if pkg_mtime < oldest_pkg_mtime:
+					oldest_pkg = pkg
+		log(LOG_LEVEL_INFO, 'Deleting oldest package: %s' % oldest_pkg, console=True)
+		local_execute_cmd('rm -rf %s/%s' % (pkg_repo, oldest_pkg))
+				
+
+	"""
+	Wrapper over __int_download_pkg() to take a lock & then run it
+	"""
+	def int_download_pkg(self, opts):
+		try:
+			with ZInstallLock('/tmp/zinstall_download') as lock:
+				try:
+					rc = self.__int_download_pkg(opts)
+					return rc
+				except Exception as e:
+					log(LOG_LEVEL_ERROR, "ERROR: Hit exception %s!" % e, console=True)
+					return -1
+		except Exception as e:
+			log(LOG_LEVEL_ERROR, "ERROR: Another download is in progress. Parallel downloads not allowed!", console=True)
+			return -1
+
+	"""
+	Helper to get remote repo co-ordinates
+	"""
+	def _get_remote_repo_coords(self, settings, opts):
+		# if its a S3 repo, pass it as is
+		if opts.remote_repo.startswith('s3:'):
+			return opts.remote_repo
+
+		if opts.pkg:
+			pkg_path = glob.glob(os.path.join(opts.remote_repo, '*%s' % opts.pkg))[0]
+			if not os.path.exists(pkg_path):
+				log(LOG_LEVEL_ERROR, 'ERROR: Cannot locate package directory [%s]!' % pkg_path, console=True)
+				return None
+		else:
+			pkg_path = opts.remote_repo
+
+		# pass this node's co-ords
+		fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, os.uname()[1])
+		if not extmgmt_ip:
+			log(LOG_LEVEL_ERROR, 'ERROR: Cannot get External Mgmt IP for sn[%s]!' % os.uname()[1], console=True)
+			return None
+
+		return '%s:%s' % (extmgmt_ip, pkg_path)
+
+	"""
+	Downloads specified package
+	"""
+	def ext_download_pkg(self, opts):
+		if not opts.pkg:
+			log(LOG_LEVEL_ERROR, 'ERROR: It is mandatory to specify package version to download!', console=True)
+			return -1
+
+		settings=self.load_settings()
+		cmd='%s --action %s --pkg %s' % (ZINSTALL, INT_REQ_DOWNLOAD_PKG, opts.pkg)
+		cmd=[ZINSTALL, '--action', INT_REQ_DOWNLOAD_PKG, '--pkg', opts.pkg]
+		tmp_remote_pkg_dir=None
+		if opts.remote_repo:
+			remote_repo = self._get_remote_repo_coords(settings, opts)
+			if not remote_repo:
+				return -1
+
+			# if we have src/ directory inside the package, copy the pkg into a tmp/ location without
+			# src/ dir in it & use that as the repo for ccmaster to download from
+			pkg_path = remote_repo.split(':')[-1]
+			if os.path.exists(os.path.join(pkg_path, 'src')):
+				tmp_remote_pkg_dir='/tmp/inst_rmt_pkg_%d' % random.randint(0,10000)
+				local_execute_cmd('rsync -Lavzh --exclude /src %s %s' % (pkg_path, tmp_remote_pkg_dir))
+				pkg_path = glob.glob(os.path.join(tmp_remote_pkg_dir, '*%s' % opts.pkg))[0]
+				remote_repo = '%s:%s' % (remote_repo.split(':')[0], pkg_path)
+
+			cmd = cmd + ['--remote_repo', remote_repo]
+
+		rc, out, err, sn_ip = self._run_on_active_cc(settings, cmd, 'download package', ssh_print_stdout=True)
+		if tmp_remote_pkg_dir:
+			local_execute_cmd('rm -rf %s' % tmp_remote_pkg_dir)
+
+		if rc != 0:
+			sys.stderr.write(err)
+		return rc
+
+	"""
+	Erases specified package
+	"""
+	def ext_erase_pkg(self, opts):
+		if not opts.pkg:
+			log(LOG_LEVEL_ERROR, 'ERROR: It is mandatory to specify package version to erase!', console=True)
+			return -1
+
+		settings=self.load_settings()
+		rc, out, err, sn_ip = self._run_on_active_cc(settings, [ZINSTALL, '--action', INT_REQ_ERASE_PKG, '--pkg', opts.pkg], 'erase package', ssh_print_stdout=True)
+		if rc != 0:
+			sys.stderr.write(err)
+			return rc
+
+		return 0
+
+	"""
+	Internal helper to erase package
+	"""
+	def int_erase_pkg(self, opts):
+		pkg_repo, local_pkgs, local_partial_pkgs = self._list_local_pkgs()
+		if opts.pkg not in (local_pkgs + local_partial_pkgs):
+			log(LOG_LEVEL_INFO, 'Package[%s] is not present in installer repository!' % opts.pkg, console=True)
+			return 0
+
+		pkg_dir=os.path.join(pkg_repo, opts.pkg)
+
+		if os.path.exists(pkg_dir):
+			local_execute_cmd('rm -rf %s' % pkg_dir)
+
+		log(LOG_LEVEL_INFO, 'Successfully removed package[%s]!' % opts.pkg, console=True)
+		return 0
+
+	"""
+	Helper to get status of all SNs connected in the cloud
+	"""
+	def _get_all_sn_status(self, settings):
+		all_sn_status=[]
+		connected_sns=[]
+		not_connected_sns=[]
+		not_installed_sns=[]
+		for sn_uname in self._get_all_sn_unames(settings):
+			sn_status={'sn_uname': sn_uname}
+
+			fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, sn_uname)
+			if not extmgmt_ip:
+				log(LOG_LEVEL_ERROR, 'ERROR: Cannot get External Mgmt IP for sn[%s]!' % sn_uname, console=True)
+				sn_status={'status': 'cannot-get-extmgmtip'}
+				all_sn_status.append(sn_status)
+				not_connected_sns.append(sn_uname)
+				continue
+
+			sn_status['extmgmt_ip'] = extmgmt_ip
+			sn_status['status'], sn_status['nova_version'], sn_status['sn_version'], sn_status['installer_version'] = self._get_sn_status(sn_uname, extmgmt_ip)
+			sn_status['sn_role'] = self._get_role_for_sn(settings, sn_uname)
+			alloc_zone_name = self._get_allocation_zone_name_for_sn(settings, sn_uname)
+			if alloc_zone_name:
+				sn_status['allocation_zone_name'] = alloc_zone_name
+			all_sn_status.append(sn_status)
+
+			if sn_status['status'] == 'down':
+				not_connected_sns.append(sn_uname)
+				continue
+
+			connected_sns.append(sn_uname)
+			if sn_status['nova_version'] in ['not-installed', 'unknown']:
+				not_installed_sns.append(sn_uname)
+
+		return all_sn_status, connected_sns, not_connected_sns, not_installed_sns
+
+	"""
+	List all SNs in the config
+	"""
+	def ext_list_sns(self, opts):
+		settings=self.load_settings()
+		FMT_STRING="%-20s | %-20s | %-8s | %-17s | %-13s | %-13s | %-20s"
+		log(LOG_LEVEL_INFO, FMT_STRING % ("SN", "Alloc_Zone_Name", "ROLE", "Status", "NOVA Version", "SN Version", "Installer Version"), console=True)
+		for sn_uname in self._get_all_sn_unames(settings):
+			fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, sn_uname)
+			alloc_zone_name = self._get_allocation_zone_name_for_sn(settings, sn_uname)
+			if not extmgmt_ip:
+				log(LOG_LEVEL_ERROR, 'ERROR: Cannot get External Mgmt IP for sn[%s]!' % sn_uname, console=True)
+				return -1
+
+			status, nova_version, sn_version, installer_version  = self._get_sn_status(sn_uname, extmgmt_ip)
+			log(LOG_LEVEL_INFO, FMT_STRING % (sn_uname, alloc_zone_name, self._get_role_for_sn(settings, sn_uname), status, nova_version, sn_version, installer_version), console=True)
+		return 0
+
+	def int_switchover_repo(self, opts):
+		if not os.path.exists(ZPKGS_DIR_DRBD):
+			os.mkdir(ZPKGS_DIR_DRBD)
+
+		for f in os.listdir(ZPKGS_DIR_LOCAL):
+			if os.path.isdir(os.path.join(ZPKGS_DIR_LOCAL, f)):
+				log(LOG_LEVEL_INFO, "\t- Switching over package[%s]!" % f, console=True)
+			else:
+				log(LOG_LEVEL_INFO, "\t- Switching over file[%s]!" % f, console=True)
+
+			# cleanup interrupted copies
+			drbd_target_dir=os.path.join(ZPKGS_DIR_DRBD, f)
+			if os.path.exists(drbd_target_dir):
+				local_execute_cmd('rm -rf %s' % drbd_target_dir)
+			# copy the package
+			local_execute_cmd('cp -pr %s %s' % (os.path.join(ZPKGS_DIR_LOCAL, f), ZPKGS_DIR_DRBD))
+
+		# finish the switch-over 
+		local_execute_cmd('touch %s' % os.path.join(ZPKGS_DIR_DRBD, '.switchover_complete'))
+		local_execute_cmd('rm -rf %s' % ZPKGS_DIR_LOCAL)
+		return 0
+
+	"""
+	Helper to get package repository directory
+	"""
+	def _get_pkg_repo_dir(self):
+		pkg_repo = ZPKGS_DIR_LOCAL
+		if os.path.exists(os.path.join(ZPKGS_DIR_DRBD, '.switchover_complete')):
+			pkg_repo = ZPKGS_DIR_DRBD
+		else:
+			# if we cant locate the switchover-complete flag & there are images registered in glance, then fake
+			# the switch-over completion now
+			rc, msg = euca_run_cmd('timeout 5 euca-describe-images')
+			if rc == 0 and msg:
+				local_execute_cmd('touch %s' % os.path.join(ZPKGS_DIR_DRBD, '.switchover_complete'))
+				local_execute_cmd('rm -rf %s' % ZPKGS_DIR_LOCAL)
+				pkg_repo = ZPKGS_DIR_DRBD
+
+		log(LOG_LEVEL_INFO, 'Selecting repo[%s]' % pkg_repo)
+		if not os.path.exists(pkg_repo):
+			os.mkdir(pkg_repo)
+		return pkg_repo
+
+	"""
+	Helper to ensure s3cfg proxy settings are setup as we expect it to
+	"""
+	def _ensure_s3cfg_proxy_settings(self):
+		# get the current proxy host/port settings in S3 config file
+		s3cfg_file = get_s3cfg_file()
+		s3cfg_proxy_host = None
+		s3cfg_proxy_port = None
+		s3cfg_use_https = None
+		f = open(s3cfg_file , 'r')
+		lines = f.readlines()
+		f.close()
+
+		nlines=''
+		for line in lines:
+			if 'proxy_host' in line:
+				s3cfg_proxy_host = line.strip().split('=')[-1].strip()
+				s3cfg_proxy_host = s3cfg_proxy_host if s3cfg_proxy_host != '' else None
+				continue
+			if 'proxy_port' in line:
+				s3cfg_proxy_port = line.strip().split('=')[-1].strip()
+				s3cfg_proxy_port = s3cfg_proxy_port if s3cfg_proxy_port != '' and s3cfg_proxy_port != '0' else None
+				continue
+			if 'use_https' in line:
+				s3cfg_use_https = line.strip().split('=')[-1].strip()
+				s3cfg_use_https = True if s3cfg_use_https == 'True' else False
+				continue
+			nlines = nlines + line
+
+		# compare it against what has to be set & do the needed setting
+		config = self.get_installer_config()
+		use_https = False if config['proxy_host'] else True
+		if s3cfg_proxy_host != config['proxy_host'] or s3cfg_proxy_port != config['proxy_port'] or s3cfg_use_https != use_https:
+			proxy_host = config['proxy_host'] if config['proxy_host'] else ''
+			proxy_port = config['proxy_port'] if config['proxy_port'] else '0'
+			nlines = nlines + 'proxy_host = ' + proxy_host + '\n'
+			nlines = nlines + 'proxy_port = ' + proxy_port + '\n'
+			nlines = nlines + 'use_https = %s' % use_https + '\n'
+
+			# commit new configuration
+			f = open(s3cfg_file , 'w')
+			f.writelines(nlines)
+			f.close()
+
+	"""
+	Helper to ensure s3cmd package is installed and its configuration file has right settings
+	"""
+	def _ensure_s3cmd_setup(self):
+		self._ensure_s3cfg_proxy_settings()
+		rc, msg = local_execute_cmd('dpkg -l s3cmd')
+		if rc == 0:
+			return rc
+
+		log(LOG_LEVEL_INFO, 'Installing s3cmd package')
+		rc, msg = local_execute_cmd('%s -r check_and_install_s3' % ZADARA_INSTALL_SH)
+		if rc != 0:
+			log(LOG_LEVEL_ERROR, 'Failed to install s3cmd package [rc:%d/msg:%s]' % (rc, msg))
+			return -1
+		return 0
+
+	"""
+	Helper to list packages at S3
+	"""
+	def _list_s3_pkgs(self, opts):
+		pkgs=[]
+
+		if not self._is_internet_enabled():
+			return pkgs
+
+		rc = self._ensure_s3cmd_setup()
+		if rc != 0:
+			return pkgs
+
+		repo = opts.remote_repo if opts.remote_repo else ZADARA_S3_PUBLIC_REPO
+		rc, msg = local_execute_cmd('s3cmd --config=%s ls %s' % (get_s3cfg_file(), repo))
+		if not msg:
+			return pkgs
+
+		if rc and 'RequestTimeTooSkewed' in msg:
+			log(LOG_LEVEL_ERROR, "ERROR: SN time is skewed with Remote Package Repository! Please fix SN time skew!", console=True)
+			return pkgs
+
+		for line in msg.split("\n"):
+			if 'DIR' in line:
+				d=line.strip().split()[-1].split("/")[-2]
+				if re.match(r'^[0-9][0-9]\.[0-9][0-9]\-*', d):
+					pkgs.append(d)
+		return sorted(pkgs)
+
+	"""
+	Helper to list packages at a specifed remote location
+	"""
+	def _list_remote_repo_pkgs(self, opts):
+		pkgs = []
+		repo_coords = opts.remote_repo.split(":")
+		rc, out, err = self.ssh_execute(repo_coords[0], ['ls', '-1l', repo_coords[1]])
+		if rc != 0:
+			return pkgs
+
+		for line in out.split("\n"):
+			if line.startswith('total'):
+				continue
+			if not line.startswith('d'):
+				continue
+
+			d = line.split()[-1].strip()
+			if '--' in d:
+				d = d.split('--')[-1]
+			if re.match(r'^[0-9][0-9]\.[0-9][0-9]\-*', d):
+				pkgs.append(d)
+		return pkgs
+
+	"""
+	Helper to list local packages
+	"""
+	def _list_local_pkgs(self):
+		pkgs=[]
+		partial_pkgs=[]
+
+		pkg_repo=self._get_pkg_repo_dir()
+		for d in os.listdir(pkg_repo):
+			pkg_dir=os.path.join(pkg_repo, d)
+			if os.path.isdir(pkg_dir):
+				if os.path.exists(os.path.join(pkg_dir, '.complete')):
+					pkgs.append(d)
+				else:
+					partial_pkgs.append(d)
+		return pkg_repo, sorted(pkgs), sorted(partial_pkgs)
+
+	def _get_packages_list(self, opts):
+		pkg_repo, local_pkgs, local_partial_pkgs = self._list_local_pkgs()
+		if opts.local_package_list:
+			print json.dumps({'pkg_repo': pkg_repo, 'pkgs':local_pkgs, 'partial_pkgs':local_partial_pkgs})
+			return 1, {}
+
+		if opts.remote_repo and not opts.remote_repo.startswith('s3:'):
+			s3_pkgs = self._list_remote_repo_pkgs(opts)
+			if len(s3_pkgs) < 1:
+				log(LOG_LEVEL_INFO, '[WARN:Cant get Remote Repo package list!]', console=True)
+		else:
+			s3_pkgs = self._list_s3_pkgs(opts)
+			if len(s3_pkgs) < 1:
+				log(LOG_LEVEL_INFO, '[WARN:Cant get S3 package list!]', console=self._is_cli_run())
+
+		pkg_list={}
+		for pkg in (local_pkgs + local_partial_pkgs):
+			misc_str=':partial' if pkg in local_partial_pkgs else ''
+			if pkg not in s3_pkgs and len(s3_pkgs) > 0:
+				pkg_list[pkg]='[downloaded%s:not-in-s3]' % misc_str
+			else:
+				pkg_list[pkg]='[downloaded%s]' % misc_str
+
+		for pkg in s3_pkgs:
+			if pkg not in pkg_list:
+				pkg_list[pkg]='[available-for-download]'
+		return 0, pkg_list
+
+	"""
+	get_package_details - internal method that runs only the active ccmaster
+	"""
+	def get_package_details(self, opts):
+		rc, pkg_list = self._get_packages_list(opts)
+		if rc > 0:
+			#_get_packages_list is asking for safe return
+			return 0
+
+		if rc < 0:
+			return rc
+
+		FMT_STRING="%-20s | %-20s"
+		log(LOG_LEVEL_INFO, FMT_STRING % ("Package", "Status"), console=True)
+		for k in sorted(pkg_list.iterkeys(), key=natural_keys):
+			log(LOG_LEVEL_INFO, FMT_STRING % (k, pkg_list[k]), console=True)
+		return 0
+
+	"""
+	List available downloaded packages
+	"""
+	def ext_list_pkgs(self, opts):
+		settings=self.load_settings()
+		cmd=[ZINSTALL, '--action', INT_REQ_GET_PACKAGE_DETAILS]
+		if opts.remote_repo:
+			remote_repo = self._get_remote_repo_coords(settings, opts)
+			if not remote_repo:
+				return -1
+
+			cmd = cmd + ['--remote_repo', remote_repo]
+
+		rc, out, err, sn_ip = self._run_on_active_cc(settings, cmd, 'get package listing', ssh_print_stdout=True)
+		if rc != 0:
+			print err
+			return rc
+
+		return 0
+
+	"""
+	Helper to get image name, given a imagename_startswith in pkg repo
+	"""
+	def _get_image_name_from_pkg_coords(self, pkg_coords, startswith_pattern):
+		if not pkg_coords:
+			return {}
+
+		rc, out, err = self.ssh_execute(pkg_coords['ccmaster_ip'], ['ls', '-1', os.path.join(pkg_coords['pkg_repo'], pkg_coords['pkg'])])
+		if rc != 0:
+			return {}
+
+		image_names={}
+		for line in out.split("\n"):
+			image_name =  line.strip().split("/")[-1]
+			valid=False
+			for pattern in startswith_pattern:
+				if image_name.startswith(pattern):
+					valid=True
+					break
+			if not valid:
+				continue
+
+			if image_name.endswith('.tgz'):
+				image_names[pattern] = image_name.split('.tgz')[0]
+			else:
+				image_names[pattern] = image_name
+		return image_names
+
+	"""
+	Download & Install package available on remote SN
+	"""
+	def int_install_remote_pkgs(self, opts):
+		rc=0
+		tmp_dir='/tmp/inst_rmt_pkg.%d' % random.randint(0,10000)
+		os.mkdir(tmp_dir)
+		for pkg in opts.pkg_path.split(","):
+			rc, out, err = self.scp_execute('zadmin@%s:%s' % (opts.ip, pkg), tmp_dir)
+			if rc != 0:
+				log(LOG_LEVEL_ERROR, "Failed to perform scp(%s:%s => %s) (rc:%d/msg:%s)" % (opts.ip, pkg, tmp_dir, rc, err))
+				break
+
+			cmd = 'dpkg -i --force-overwrite %s' % os.path.join(tmp_dir, pkg.split("/")[-1])
+			rc, msg = local_execute_cmd(cmd)
+			if rc != 0:
+				log(LOG_LEVEL_ERROR, "Failed to perform(%s) (rc:%d/msg:%s)" % (cmd, rc, msg))
+				break
+			log(LOG_LEVEL_INFO, "Success in performing(%s)" % cmd)
+
+		local_execute_cmd('rm -rf %s' % tmp_dir)
+		return rc
+
+	# Helper in acheiving CC failover
+	def __load_failover_target(self):
+		try:
+			if not os.path.exists(CC_FAILOVER_MARKER):
+				return None
+
+			return json.loads(open(CC_FAILOVER_MARKER, 'r').read()).get('target')
+		except Exception as e:
+			return None
+
+	# Helper in acheiving CC failover
+	def __save_failover_target(self, target_sn_uname):
+		f = open(CC_FAILOVER_MARKER, 'w')
+		f.write(json.dumps({'target':target_sn_uname}))
+		f.flush()
+		os.fdatasync(f)
+		f.close()
+
+	# Helper in acheiving CC failover
+	def __clear_failover_target(self):
+		if os.path.exists(CC_FAILOVER_MARKER):
+			os.remove(CC_FAILOVER_MARKER)
+
+	"""
+	Trigger CC Failover
+	"""
+	def int_trigger_cc_failover(self, opts):
+		rc, msg = commands.getstatusoutput('drbdadm dstate drbd0')
+		if rc != 0 or msg.strip() != "UpToDate/UpToDate":
+			log(LOG_LEVEL_ERROR, 'DRBD state is [%s]. Cannot initiate failover' % msg.strip())
+			return -1
+
+		rc, msg = commands.getstatusoutput('drbdadm role drbd0')
+		if rc != 0 or msg.strip() != "Primary/Secondary":
+			log(LOG_LEVEL_ERROR, 'DRBD role is [%s]. Cannot initiate failover' % msg.strip())
+			return -1
+
+		sn_uname = os.uname()[1]
+		target = self.__load_failover_target()
+		if target:
+			if target != sn_uname:
+				log(LOG_LEVEL_ERROR, 'Failover state file already exists with target[%s]. Cannot initiate failover' % target)
+			else:
+				log(LOG_LEVEL_ERROR, 'Failover already initiated for target[%s]. Cannot re-initiate failover' % target)
+			return -1
+
+		# update failover file to indicate that a failover has been initiated
+		self.__save_failover_target(sn_uname)
+
+		rc, msg = commands.getstatusoutput('crm_attribute -N %s -n standby -v on -l forever' % sn_uname)
+		if rc != 0:
+			self.__clear_failover_target()
+			fail_and_exit('Failed to set SN %s to offline (%d:%s)' % (sn_uname, rc, msg))
+
+		log(LOG_LEVEL_INFO, 'Successfully set %s to offline' % sn_uname)
+		return 0
+
+	"""
+	Continue a previously initited CC failover
+	"""
+	def int_continue_cc_failover(self, opts):
+		target = self.__load_failover_target()
+		if not target or target == os.uname()[1]:
+			return -1
+
+		log(LOG_LEVEL_INFO, 'Continuing failover')
+		rc, msg = commands.getstatusoutput('crm_attribute -N %s -n standby -v off -l forever' % target)
+		if rc != 0:
+			log(LOG_LEVEL_ERROR, 'Failed to set SN %s to online (%d:%s)' % (target, rc, msg))
+
+		self.__clear_failover_target()
+		log(LOG_LEVEL_INFO, 'Successfully set %s to online' % target)
+		return 0
+
+	"""
+	Helper to install pkgs specified in pkg_path available at source_ip on all nodes of cloud
+	"""
+	def _cloud_install_pkgs(self, settings, source_ip, pkg_path, msg):
+		not_connected_sns=[]
+		success_sns=[]
+		failed_sns=[]
+
+		not_connected_sns=[]
+		self._log_installer_phase_start('Cloud Install Packages %s' % msg)
+		cmd=[ZINSTALL, '--action', INT_REQ_INSTALL_REMOTE_PKGS, '--ip', source_ip, '--pkg_path', pkg_path]
+		for sn_uname in self._get_all_sn_unames(settings):
+			fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, sn_uname)
+			if not extmgmt_ip:
+				log(LOG_LEVEL_ERROR, 'ERROR: Cannot get External Mgmt IP for sn[%s]!' % sn_uname, console=True)
+				not_connected_sns.append(sn_uname)
+				continue
+
+			status, nova_version, sn_version, installer_version = self._get_sn_status(sn_uname, extmgmt_ip)
+			if status != 'connected':
+				log(LOG_LEVEL_INFO, '\t- SN [%s] is not connected. Skipping install!' % sn_uname, console=True)
+				not_connected_sns.append(sn_uname)
+				continue
+
+			rc, out, err = self.ssh_execute(extmgmt_ip, cmd)
+			if rc == 0:
+				log(LOG_LEVEL_INFO, '\t- SN [%s] - Success' % sn_uname, console=True)
+				success_sns.append(sn_uname)
+			else:
+				log(LOG_LEVEL_ERROR, '\t- SN [%s] - Failed' % sn_uname, console=True)
+				failed_sns.append(sn_uname)
+		self._log_installer_phase_stop()
+		return success_sns, failed_sns, not_connected_sns
+
+	"""
+	Install package across all SNs of the cloud
+	"""
+	def ext_cloud_install_pkg(self, opts):
+		if not opts.pkg_path:
+			log(LOG_LEVEL_ERROR, "ERROR: It is mandatory to specify 'pkg_path' for %s" % EXT_REQ_CLOUD_INSTALL_PKG, console=True)
+			return -1
+
+		pkgs = opts.pkg_path.split(',')
+		for pkg in pkgs:
+			if not pkg.startswith("/") or not os.path.exists(pkg):
+				log(LOG_LEVEL_ERROR, "ERROR: Absolute path not given or package doesnt exist in location for package[%s]!" % pkg, console=True)
+				return -1
+
+		settings=self.load_settings()
+		sn_uname=os.uname()[1]
+		fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, sn_uname)
+		if not extmgmt_ip:
+			log(LOG_LEVEL_ERROR, 'ERROR: Cannot get External Mgmt IP for sn[%s]!' % sn_uname, console=True)
+			return -1
+
+		success_sns, failed_sns, not_connected_sns = self._cloud_install_pkgs(settings, extmgmt_ip, opts.pkg_path, '')
+		return 0
+
+	"""
+	Register VC/CCVM images out of package in glance
+	"""
+	def ext_register_images_in_glance(self, opts):
+		if not opts.pkg:
+			log(LOG_LEVEL_ERROR, 'ERROR: It is mandatory to specify package version for %s!' % opts.action, console=True)
+			return -1
+
+		settings = self.load_settings()
+		pkg_coords = self._do_package_validation_checks_and_get_coords(opts, settings)
+		if not pkg_coords:
+			return -1
+
+		self._log_installer_phase_start('Registering VC/CCVM Images in pkg[%s]' % opts.pkg)
+		for role in ['ccmaster', 'ccslave']:
+			sn_uname = self._get_sn_uname_by_role(settings, role) 
+			fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, sn_uname)
+			sn = {'uname':sn_uname, 'ip':extmgmt_ip}
+			sn_role = self._get_current_sn_role(sn)
+			if sn_role == 'active':
+				rc = self._stage_packages_for_install(settings, sn, pkg_coords, 'Registering VC/CCVM Images in Glance')
+				if rc == 0:
+					rc = self._register_images_in_glance(sn, pkg_coords)
+				if rc == 0:
+					self._set_ccvm_default_vc_image(pkg_coords)
+					self._destage_packages_after_install(settings, sn, pkg_coords, 'Registering VC/CCVM Images in Glance')
+					self._log_installer_phase_stop()
+				return rc
+
+		log(LOG_LEVEL_ERROR, "ERROR: Failed to locate current ccmaster to perform register images", console=True)
+		return -1
+
+	"""
+	Helper to get installer config
+	"""
+	def _get_installer_config(self):
+		try:
+			f = open(os.path.join(self._get_pkg_repo_dir(), INSTALL_CONFIG_FILE))
+			obj = pickle.load(f)
+			f.close()
+			return obj
+		except:
+			conf = {}
+			for v in supported_installer_config:
+				conf[v] = None
+			return conf
+
+	"""
+	Wrapper over _get_installer_config() that can be used on any SN
+	"""
+	def get_installer_config(self):
+		if self._get_local_sn_role() != 'active':
+			# current node is not ccmaster. re-run same command on ccmaster
+			settings = self.load_settings()
+			rc, out, err, sn_ip = self._run_on_active_cc(settings, [ZINSTALL, '--action', INT_REQ_GET_CONFIG], 'Get config')
+			if rc != 0:
+				log(LOG_LEVEL_ERROR, "ERROR: Failed to perform show config at CCmaster! (rc:%d/err:%s)" % (rc, err))
+				return {}
+			return json.loads(out.strip())
+
+		# running on ccmaster, get the config directly
+		return self._get_installer_config()
+
+	"""
+	Internal helper to dump config in json format
+	"""
+	def int_get_config(self, opts):
+		print json.dumps(self._get_installer_config())
+		return 0
+
+	"""
+	Internal helper to make sure vlan pkg is installed
+	"""
+	def int_ensure_vlan_pkg(self, opts):
+		self._ensure_apt_setup_for_proxy()
+
+		rc, out, err = execute_cmd_by_subprocess(['dpkg', '-l', 'vlan'])
+		if rc == 0 and out:
+			for line in out.split('\n'):
+				if 'vlan' in line and line.startswith('ii'):
+					log(LOG_LEVEL_INFO, "\t- VLAN package already installed on [%s]" % os.uname()[1], console=True)
+					return 0
+
+		rc, msg=local_execute_cmd('%s -r install_package -k vlan' % ZADARA_INSTALL_SH)
+		if rc == 0:
+			log(LOG_LEVEL_INFO, "\t- Successfully installed VLAN package on [%s]" % os.uname()[1], console=True)
+		else:
+			log(LOG_LEVEL_ERROR, "\t- Failed to install VLAN package on [%s] (msg:%s)" % (os.uname()[1], msg), console=True)
+		return rc
+
+	"""
+	Show installer config
+	"""
+	def ext_show_config(self, opts):
+		config = self.get_installer_config()
+		print 'Installer Configuration parameters:'
+		for k, v in config.items():
+			print '\t%s = %s' % (k,v)
+		return 0
+
+	"""
+	External:Set installer config
+	"""
+	def ext_set_config(self, opts):
+		if not opts.param:
+			print 'ERROR: It is manadatory to specify param for setting config!'
+			return -1
+
+		if opts.param not in supported_installer_config:
+			print 'ERROR: Attempting to set unsupported parameter[%s]! Supported parameters[%s]' % (opts.param, supported_installer_config)
+			return -1
+
+		if self._get_local_sn_role() != 'active':
+			# current node is not ccmaster. re-run same command on ccmaster
+			settings = self.load_settings()
+			cmd = [ZINSTALL, '--action', INT_REQ_SET_CONFIG, '--param', opts.param]
+			if opts.value:
+				cmd = cmd + ['--value', opts.value]
+			rc, out, err, sn_ip = self._run_on_active_cc(settings, cmd, 'Set installer config')
+			if rc != 0:
+				log(LOG_LEVEL_ERROR, "ERROR: Failed to perform set config at CCmaster! (rc:%d/err:%s)" % (rc, err), console=True)
+			return rc
+
+		return self.int_set_config(opts)
+
+	"""
+	Internal:Set installer config
+	"""
+	def int_set_config(self, opts):
+		# running on ccmaster, modify the specific config
+		config = self._get_installer_config()
+		config[opts.param] = opts.value if opts.value and opts.value != 'None' else None
+		f = open(os.path.join(self._get_pkg_repo_dir(), INSTALL_CONFIG_FILE), "w")
+		pickle.dump(config, f)
+		f.close()
+		return 0
+
+	"""
+	Helper to setup APT proxy settings file
+	"""
+	def _ensure_apt_setup_for_proxy(self):
+		config = self.get_installer_config()
+		if config['proxy_host']:
+			proxy_host = config['proxy_host']
+			proxy_port = config['proxy_port'] if config['proxy_port'] else '0'
+
+			if not os.path.exists(ZADARA_APT_PROXY_DIR):
+				os.makedirs(ZADARA_APT_PROXY_DIR)
+
+			f = open(ZADARA_APT_PROXY_FILE, 'w')
+			f.write('Acquire::http::Proxy "http://%s:%s/";\n' % (proxy_host, proxy_port))
+			f.write('Acquire::https::Proxy "http://%s:%s/";\n' % (proxy_host, proxy_port))
+			f.write('Acquire::ftp::Proxy "http://%s:%s/";\n' % (proxy_host, proxy_port))
+			f.close()
+		elif os.path.exists(ZADARA_APT_PROXY_FILE):
+			os.unlink(ZADARA_APT_PROXY_FILE)
+
+	"""
+	Wrapper over _ensure_apt_setup_for_proxy() that can be used on any SN
+	"""
+	def ensure_apt_setup_for_proxy(self, sn):
+		rc, out, err = self.ssh_execute(sn['ip'], [ZINSTALL, '--action', INT_REQ_ENSURE_APT_SETUP_FOR_PROXY], print_stdout=True)
+		if rc != 0:
+			log(LOG_LEVEL_ERROR, 'ERROR: Failed to ensure APT Proxy settings on[%s]!' % sn['uname'], console=True)
+		return rc
+
+	"""
+	Internal:ensure APT proxy settings
+	"""
+	def int_ensure_apt_setup_for_proxy(self, opts):
+		self._ensure_apt_setup_for_proxy()
+		return 0
+
+	"""
+	Helper to pull ip to nw-label mapping of VPSA ip addresses by looking at instances of VC's
+	"""
+	def _get_vsa_ip_to_nw_label(self, settings, vsa):
+		null = None;false = False; true = True # For eval() that we do below
+		ip_to_nw_label={}
+		try:
+			msg = self._run_azaccess_api_with_retries(settings, getattr(self, '_run_azaccess_get_vsa_instances'), {'vsa_name':vsa['name']})
+			out = eval(msg)['servers']
+			for instance in out:
+				for label in instance['addresses']:
+					ip_to_nw_label[instance['addresses'][label][0]['addr']] = label
+		except Exception as e:
+			pass
+		return ip_to_nw_label
+
+	"""
+	Helper to get all VPSAs in cloud in one go
+	"""
+	def _run_azaccess_get_all_vsas(self, settings, args):
+		offset=0
+		limit=1000
+		base_vsa_url = '/'.join(self.az_access._get_vsa_url("1").split("/")[0:-1])
+
+		vsas=[]
+		while True:
+			msg = self.az_access._expiration_proof_get(base_vsa_url + '/detail?limit=%d&offset=%d' % (limit, offset))
+			if not msg or len(msg) == 0:
+				return vsas
+			js = json.loads(msg)
+			_vsas = js.get('vsaSet')
+			if len(_vsas) > 0:
+				vsas = vsas + _vsas
+			# if we didnt get any vsas or exactly at iimit, we need to retry with new offset
+			if len(_vsas) == 0 or len(_vsas) < limit:
+				break
+			offset = offset+limit
+
+		return vsas
+
+	"""
+	Helper to get all VPSAs to drive hosts mapping
+	"""
+	def _get_all_vsas_to_drivehost_mapping(self, settings, args):
+		offset=0
+		limit=1000
+		base_osvols_url = '/'.join(self.az_access._get_vsa_url("1").split("/")[0:-2]) + '/os-volumes'
+
+		vsas_drivehost_mapping={}
+		while True:
+			msg = self.az_access._expiration_proof_get(base_osvols_url + '/detail?limit=%d&offset=%d' % (limit, offset))
+			if not msg or len(msg) == 0:
+				return vsas_drivehost_mapping
+			js = json.loads(msg)
+			_vols = js.get('volumes')
+			for vol in _vols:
+				# ignore vol if it doesnt have details for us to lookup
+				if 'to_vsa_id' not in vol['metadata'] or 'host' not in vol:
+					continue
+
+				vsa_id = int(vol['metadata']['to_vsa_id'])
+				if vsa_id not in vsas_drivehost_mapping:
+					vsas_drivehost_mapping[vsa_id] = []
+				vsas_drivehost_mapping[vsa_id].append(str(vol['host']))
+
+			if len(_vols) == 0 or len(_vols) < limit:
+				break
+			offset = offset+limit
+
+		return vsas_drivehost_mapping
+
+	"""
+	Helper to get list of hosts that are hosting vsa's drives & caching it for future lookups
+	"""
+	def _get_vsa_drives_host_list(self, vsa_id):
+		global cached_vsa_drive_host_mapping
+
+		if vsa_id in cached_vsa_drive_host_mapping:
+			return cached_vsa_drive_host_mapping[vsa_id]
+
+		msg = self.az_access._expiration_proof_get(self.az_access._get_vsa_url(vsa_id)+ '/drives')
+		if  (not msg) or (len(msg) == 0):
+			return None
+		js = json.loads(msg)
+		drives = js.get('drives')
+		drive_host_list = []
+		for drive in drives:
+			drive_host_list.append(str(drive['host']))
+
+		cached_vsa_drive_host_mapping[vsa_id] = drive_host_list # maintain in a cache for next time faster lookup
+		return drive_host_list
+
+	def _run_azaccess_get_tenants(self, settings, args):
+		return self.az_access.get_tenants(settings['SERVICE_TOKEN'])
+
+	def _run_azaccess_get_vsas(self, settings, args):
+		return self.az_access.get_vsas(args['tenant_id'], settings['SERVICE_TOKEN'])
+
+	def _run_azaccess_get_vsa_data(self, settings, args):
+		return self.az_access.get_vsa_data(args['tenant_id'], args['vsa_id'])
+
+	def _run_azaccess_get_vsa_instances(self, settings, args):
+		return self.az_access._expiration_proof_get(self.az_access._get_vsa_url(args['vsa_name']) + '/instances')
+
+	def _run_azaccess_get_vsa_drives_info(self, settings, args):
+		return self._get_vsa_drives_host_list(args['vsa_name'])
+
+	"""
+	Helper to get glance image id to image name mapping list
+	"""
+	def _run_azaccess_get_all_images(self, settings, args):
+		glance_images_map = {}
+
+		out  = self.az_access._get_project_data('images')
+		if not out or out == '':
+			return glance_images_map
+
+		ie = json.loads(out)
+		images = ie.get('images')
+		if not images or len(images) <= 0:
+			return glance_images_map
+
+		for image in images:
+			name = str(image.get('name')) # str(None) is 'None'
+			glance_images_map[name] = str(image['id'])
+		return glance_images_map
+
+	def _lookup_image_id_to_name(self, glance_images_map, image_id):
+		img_id = str(image_id)
+		for image_name in  glance_images_map:
+			if glance_images_map[image_name] == img_id:
+				return image_name
+		return None
+
+	def _run_azaccess_api_with_retries(self, settings, func, args):
+		while True:
+			try:
+				return func(settings, args)
+			except Exception as e:
+				if 'zCurl failed to connect' in '%s' % e:
+					log(LOG_LEVEL_INFO, "INFO: Cant connect to Nova API to get list of VPSAs. Retrying after timeout!")
+					time.sleep(1)
+					continue
+				raise e
+
+	def _get_all_vpsas(self, settings):
+		self._log_installer_sub_phase_start('Getting list of VPSAs')
+		self._load_decrypt_modules()
+
+		# Get list of all VPSAs, all drives at nova & all images at glance
+		vsas = []
+		all_vsas = self._run_azaccess_api_with_retries(settings, getattr(self, '_run_azaccess_get_all_vsas'), {})
+		vsas_drivehost_mapping = self._run_azaccess_api_with_retries(settings, getattr(self, '_get_all_vsas_to_drivehost_mapping'), {})
+		glance_images_map = self._run_azaccess_api_with_retries(settings, getattr(self, '_run_azaccess_get_all_images'), {})
+
+		for vsa in all_vsas:
+			log(LOG_LEVEL_INFO, "\t- Fetching details of vsa[%s]!" % vsa['name'], console=True)
+
+			# if possible get service-mode info from VPSA user-data
+			vsa['service_mode']=0
+			if self.can_decrypt_user_data and vsa.get('user_data'):
+				aes_obj = self.AES.new(self.AES_DECRYPT_KEY, self.AES.MODE_CFB)
+				user_data = aes_obj.decrypt(self.base64.b64decode(vsa.get('user_data')))
+				user_data_js = json.loads(user_data)
+				if 'service_mode' in user_data:
+					vsa['service_mode']=int(user_data_js.get('service_mode'))
+			vsa['vc_type'] = str(vsa['vcType'])
+			vsa['display_name'] = str(vsa['displayName'])
+			vsa['vc_count'] = vsa['vcCount']
+			vsa['image'] = self._lookup_image_id_to_name(glance_images_map, vsa['image_id'])
+			if vsa['image']:
+				image_ver = int(vsa['image'].split('-')[1].split('.')[0])
+				vsa['version'] = 'V1' if (image_ver > 0 and image_ver < 13) else 'V2'
+			else:
+				vsa['version'] = 'V2' if 'V2' in vsa['vc_type'] else 'V1'
+				log(LOG_LEVEL_WARN, "\t- WARN: Failed to locate glance image for VSA[%s]. Resorted to version[%s] based on VC-type!" % (vsa['name'], vsa['version']), console=True)
+
+			# Get VC IP's from VSA extra-specs
+			null = None;false = False; true = True # For eval() that we do below
+			extra_specs = vsa['extra_specs']
+			vsa['fixed_ips'] = []
+			vsa['floating_ips'] = []
+			ip_to_nw_label = {}
+			for idx in range(0,2):
+				vc_nw_label = 'vc_%d_nw' % idx
+				vc_fixed_ips = 'vc_%d_fixed_ips' % idx
+				if vc_nw_label not in extra_specs:
+					continue
+
+				vsa[vc_nw_label] = {}
+				vsa[vc_fixed_ips] = []
+				for nw in eval(extra_specs[vc_nw_label]):
+					# if we dont have label in extra-specs, try to pull out  of instances
+					if 'label' not in nw:
+						if len(ip_to_nw_label) == 0:
+							ip_to_nw_label = self._get_vsa_ip_to_nw_label(settings, vsa)
+
+						# if we cannot get the IP<>label mapping here, its fine. could be just
+						# due to custom network VPSAs not having this info. Just continue
+						if nw['address'] not in ip_to_nw_label:
+							continue
+						nw_label = ip_to_nw_label[nw['address']]
+					else:
+						nw_label = nw['label']
+
+					vsa[vc_nw_label][nw_label] = nw['address']
+					# pick only HB networks as VSA IP's
+					if 'HB' in nw_label:
+						# for now pick only HB1 interface. No need to try BE
+						if 'HB1' in nw_label:
+							vsa[vc_fixed_ips].append(nw['address'])
+							vsa['fixed_ips'].append(nw['address'])
+					else:
+						vsa['floating_ips'].append(nw['address'])
+
+			# get the list of SNs on which this VSA is related with
+			# we will just consider the list of SNs that have drives for the VPSA
+			# instance_hosts = [str(extra_specs['active_vc_hostname'])]
+			if vsa['id'] in vsas_drivehost_mapping:
+				drive_hosts = vsas_drivehost_mapping[vsa['id']]
+			else:
+    				drive_hosts = self._run_azaccess_api_with_retries(settings, getattr(self, '_run_azaccess_get_vsa_drives_info'), {'vsa_name':vsa['name']})
+			vsa['drive_hosts'] = list(set(drive_hosts)) # remove duplicates & get the list of hosts on which VSA is involved with
+
+			# Add this VSA record into list of VSAs
+			vsas.append(vsa)
+
+		"""
+		saved_tenant = self.az_access.setting['TENANT'] 
+		for vsa in vsas:
+			self.az_access.setting['TENANT'] = vsa['tenant_id']
+			vsa['instances'], vsa['instance_hosts'] = self.az_access.get_vsa_instances(vsa['name'])
+		self.az_access.setting['TENANT'] = saved_tenant
+		"""
+
+		self._log_installer_sub_phase_stop('Done - Got [%d] VPSAs' % len(vsas))
+		return vsas
+
+	def _get_vsa_upgrade_status(self, vsa):
+		self._load_vsa_access_modules()
+
+		err = 'Unable to issue REST API'
+		for ip in vsa['fixed_ips']:
+			url = 'http://%s/api/vpsa/redundancy_status' % ip
+			response = None
+			try:
+				req = self.urllib2.Request(url)
+				response = self.urllib2.urlopen(req, timeout=10)
+				out = response.read()
+				status = response.getcode()
+			except Exception as e:
+				log(LOG_LEVEL_INFO, "VSA[%s] - Unable to open url[%s]. %s" % (vsa['name'], url, e))
+				err = '%s' % e
+				continue
+			finally:
+				if response:
+					response.close()
+
+			if status != 200:
+				log(LOG_LEVEL_INFO, "VSA[%s] - url[%s] failed with status[%d] - response(%s)" % (vsa['name'], url, status, out))
+				continue
+
+			log(LOG_LEVEL_INFO, "VSA[%s] - url[%s] suceeded" % (vsa['name'], url))
+			xml = self.ET.fromstring(out)
+			rc = int(xml.findtext("status"))
+			err = xml.findtext("status-msg")
+			if rc != 0:
+				continue
+
+			vsa_xml = xml.find('vsa')
+			redundancy_status = vsa_xml.findtext('redundancy-status')
+			reason = vsa_xml.findtext('reason')
+			if redundancy_status == 'Degraded' and 'Other controller role is active' in reason:
+				log(LOG_LEVEL_INFO, "VSA[%s] - url[%s] points to passive VC. Retry other IP" % (vsa['name'], url))
+				continue
+
+			return redundancy_status, reason
+
+		return "Failed-to-Fetch", err
+
+	def _check_all_vpsas_are_normal(self, settings, check_reason, blocking_wait, filter_vsas_on_sn=None):
+		self._load_az_access_modules(settings)
+
+		self._log_installer_phase_start('Checking VPSA states - %s' % check_reason)
+
+		while True:
+			try:
+				vsas = self._get_all_vpsas(settings)
+				break
+			except Exception as e:
+				log(LOG_LEVEL_ERROR, "ERROR: Exception in getting all VPSAs! (%s)" % e, console=True)
+				log_exception_stack()
+				return -1, None, None
+
+		# It can happen that there are no VPSAs, in that case "vsas" will be an empty list
+		if vsas is None:
+			return 0, None, None
+
+		upgradeable_vsas=[]
+		error_vsas=[]
+		self._log_installer_sub_phase_start('Getting VPSA redundancy status')
+		for vsa in vsas:
+			vsa_name = '[%s/%s]' % (vsa['name'], vsa['display_name'])
+			if filter_vsas_on_sn and filter_vsas_on_sn not in vsa['drive_hosts']:
+				log(LOG_LEVEL_INFO, "\t- %-40s - VPSA doesnt have drives from SN[%s]. Hence wont be considered for this SN upgrade check!" % (vsa_name, filter_vsas_on_sn), console=True)
+				continue
+
+			if vsa['service_mode']:
+				log(LOG_LEVEL_INFO, "\t- %-40s - SERVICE MODE VPSA. Wont be considered for upgrade checks!" % vsa_name, console=True)
+				continue
+
+			if 'zios' in vsa['vc_type'].lower():
+				log(LOG_LEVEL_INFO, "\t- %-40s - ZIOS. Wont be considered for upgrade checks!" % vsa_name, console=True)
+				continue
+
+			#################################
+			# VSA state checks & its handling
+			#################################
+
+			# if VSA is coming up, wait for it to come up fully
+			if vsa['status'] == 'creating' or vsa['status'] == 'launching' or vsa['status'] == 'booting' or vsa['status'] == 'reconfiguring':
+				self._do_waited_operation('_wait_for_vsa_to_come_up', msg=None, obj=vsa, interval=0.3, eval_msg_fn='_wait_for_vsa_to_come_up_msg')
+
+			# if VSA is hibernating, wait for it to hibernate fully
+			if vsa['status'] == 'hibernate_offlining' or vsa['status'] == 'hibernating':
+				self._do_waited_operation('_wait_for_vsa_to_hibernate', msg=None, obj=vsa, interval=0.3, eval_msg_fn='_wait_for_vsa_to_hibernate_msg')
+
+			# if VSA is going down or is hibernated, dont consider in upgrade check
+			if vsa ['status'] == 'deleted' or vsa['status'] == 'delete_offlining' or vsa['status'] == 'deleting' or vsa['status'] == 'delete_failed' or vsa['status'] == 'hibernated':
+				log(LOG_LEVEL_INFO, "\t- %-40s - %s VPSA is in [%s] state. Wont be considered for upgrade checks!" % (vsa_name, vsa['version'], vsa['status']), console=True)
+				continue
+
+			# if VSA is in error states, dont allow upgrade
+			if vsa['status'] == 'partial' or vsa['status'] == 'failed' or vsa['status'] == 'hibernate_failed':
+				log(LOG_LEVEL_INFO, "\t- %-40s - %s VPSA is in [%s] state. Upgrade not-allowed!" % (vsa_name, vsa['version'], vsa['status']), console=True)
+				error_vsas.append(vsa)
+				continue
+
+			# We have a VSA that passed state-checking. Wait for its upgrade-status to turn Normal
+			self._do_waited_operation('_wait_for_vsa_normal_upgrade_status', msg=None, obj={'blocking_wait':blocking_wait, 'vsa':vsa}, eval_msg_fn='_wait_for_vsa_normal_upgrade_status_msg')
+
+			if vsa['upgrade_status'] == 'Normal':
+				upgradeable_vsas.append(vsa)
+			else:
+				error_vsas.append(vsa)
+		self._log_installer_sub_phase_stop('- Done. [%d] errors observed!' % len(error_vsas))
+
+		self._log_installer_phase_stop()
+		return 0, upgradeable_vsas, error_vsas
+
+	"""
+	Performs SN upgrade with all VPSA state checks
+	"""
+	def perform_sn_upgrade_with_vpsa_checks(self, opts, settings, sn_uname):
+		if not opts.skip_vsa_checks:
+			# before starting upgrade on a SN, wait for all VPSAs to turn to normal state
+			rc, upgradeable_vsas, error_vsas = self._check_all_vpsas_are_normal(settings, '[Check before upgrading %s]' % sn_uname, blocking_wait=True, filter_vsas_on_sn=sn_uname)
+			if rc != 0 or len(error_vsas):
+				log(LOG_LEVEL_ERROR, 'ERROR: Failed to get all VPSAs to Normal running condition! Ending upgrade!', console=True)
+				return -1
+
+		self._log_installer_phase_start('Performing SN Upgrade of [%s]!' % sn_uname)
+		fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, sn_uname)
+		if not extmgmt_ip:
+			log(LOG_LEVEL_ERROR, 'ERROR: Cannot get External Mgmt IP for sn[%s]!' % sn_uname, console=True)
+			return -1
+
+		sn = {'ip':extmgmt_ip, 'role':self._get_role_for_sn(settings, sn_uname), 'uname':sn_uname}
+
+		# do one precheck round of DRBD health check before continuing, so that we can reliably determine CC coords
+		rc = self._drbd_state_precheck_for_sn_upgrade(settings, sn, wait_on_drbd_state=True)
+		if rc != 0:
+			return rc
+
+		# Get pkg co-ords just before upgrade of the SN, as we might have ccmaster shift b/n the CC nodes
+		pkg_coords = self._do_package_validation_checks_and_get_coords(opts, settings)
+		if not pkg_coords:
+			log(LOG_LEVEL_ERROR, 'ERROR: Cannot get Package co-ordinates while working on [%s]!' % sn_uname, console=True)
+			return -1
+
+		# Trigger SN upgrade
+		rc = self._perform_upgrade(settings, sn, pkg_coords, wait_on_drbd_state=True)
+		if rc != 0:
+			log(LOG_LEVEL_ERROR, 'ERROR: Failed to upgrade SN[%s]. Ending cloud_upgrade!' % sn_uname, console=True)
+			return -1
+
+		self._log_installer_phase_stop()
+		return 0
+
+	"""
+	Helper to get current ccmaster/ccslave SN unames
+	"""
+	def _get_current_ccmaster_ccslave(self, settings):
+		# get the current role of designated ccmaster & based on that make determination of current ccmaster/ccslave
+		ccmaster = self._get_sn_uname_by_role(settings, 'ccmaster')
+		ccslave = self._get_sn_uname_by_role(settings, 'ccslave')
+
+		fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, ccmaster)
+		sn_role = self._get_current_sn_role({'uname':ccmaster, 'ip': extmgmt_ip})
+		if sn_role == 'active':
+			return ccmaster, ccslave
+		else:
+			return ccslave, ccmaster
+
+	"""
+	Helper that upgrades all SNs of cloud, after checking that VPSA states are alright
+	"""
+	def sn_upgrade_all(self, settings, opts):
+		# prepare the list of SN's to upgrade & in the order (ccslave, ccmaster & rest of SNs)
+		ccmaster, ccslave = self._get_current_ccmaster_ccslave(settings)
+		all_sn_unames=self._get_all_sn_unames(settings)
+		all_sn_unames=list(filter((ccmaster).__ne__, all_sn_unames))
+		all_sn_unames=list(filter((ccslave).__ne__, all_sn_unames))
+
+		for sn_uname in [ccslave, ccmaster] + all_sn_unames:
+			rc = self.perform_sn_upgrade_with_vpsa_checks(opts, settings, sn_uname)
+			if rc != 0:
+				return rc
+
+		return 0
+
+	def _upgrade_one_vsa(self, settings, vsa, vc_image, action_id):
+		vsa_name = '[%s/%s]' % (vsa['name'], vsa['display_name'])
+
+		self._log_installer_phase_start('Performing VPSA Upgrade of %s!' % vsa_name)
+		if vsa['version'] != 'V2':
+			log(LOG_LEVEL_INFO, '\t- Not upgrading %s as its a [%s] version VPSA' % (vsa_name, vsa['version']), console=True)
+			self._log_installer_phase_stop()
+			return 0
+
+		# Wait for VSA's upgrade-status to turn Normal, just before upgrading VSA
+		vsa['upgrade_status'] = 'Fetching'
+		self._do_waited_operation('_wait_for_vsa_normal_upgrade_status', msg=None, obj={'blocking_wait':True, 'vsa':vsa}, eval_msg_fn='_wait_for_vsa_normal_upgrade_status_msg')
+		if vsa['upgrade_status'] != 'Normal':
+			log(LOG_LEVEL_ERROR, "ERROR: Failed to get VPSA[%s] to Normal status. Failing cloud_upgrade!" % vsa_name, console=True)
+			return -1
+
+		log(LOG_LEVEL_INFO, '\t- Upgrading %s from [%s] to [%s] - reference[%s]' % (vsa_name, vsa['image'], vc_image, action_id), console=True)
+		cmd = [VPSA_REQUESTS_PY, '--token', settings['SERVICE_TOKEN'], '--tenant', vsa['tenant_id'], '--vsa', vsa['name'], '--action_id', action_id, '--action', 'upgrade_version', '--target', vc_image]
+		rc, out, err, sn_ip = self._run_on_active_cc(settings, cmd, 'Perform VSA[%s] upgrade' % vsa['name'])
+		if rc != 0:
+			if 'Upgrade to same version %s not allowed' % vc_image in out:
+				log(LOG_LEVEL_INFO, '\t- %s has already been upgraded to %s. Not upgrading!' % (vsa_name, vc_image), console=True)
+				self._log_installer_phase_stop()
+				return 0
+
+			log(LOG_LEVEL_ERROR, "ERROR: Failed to upgrade %s with [%s]. Failing cloud_upgrade!" % (vsa_name, vc_image), console=True)
+			log(LOG_LEVEL_ERROR, "%s Upgrade error (rc:%d/out:%s/err:%s)" % (vsa_name, rc, out, err))
+			return -1
+
+		# Now that we have initiated a VPSA upgrade, wait for it to complete
+		obj={'action_id':action_id, 'vsa':vsa, 'settings':settings, 'upgrade_status': {'status':'started', 'message':'started'}}
+		self._do_waited_operation('_wait_for_vsa_upgrade_to_complete', msg=None, obj=obj, interval=1, eval_msg_fn='_wait_for_vsa_upgrade_to_complete_msg')
+
+		upgrade_status=obj['upgrade_status']
+		if upgrade_status['status'] != 'done':
+			if not (upgrade_status['status'] == 'error' and 'similar origin and target images' in upgrade_status['message']):
+				log(LOG_LEVEL_ERROR, '\t- ERROR: Failed to upgrade %s. [%s]/[%s]' % (vsa_name, upgrade_status['status'], upgrade_status['message']), console=True)
+				return -1
+
+		# successfully upgraded VSA, delete the action
+		log(LOG_LEVEL_INFO, "%s Upgraded successfully" % vsa_name)
+		cmd = [VPSA_REQUESTS_PY, '--token', settings['SERVICE_TOKEN'], '--tenant', vsa['tenant_id'], '--vsa', vsa['name'], '--action', 'delete_by_pattern', '--target', action_id]
+		rc, out, err, sn_ip = self._run_on_active_cc(settings, cmd, 'Deleting upgrade action for %s' % vsa['name'])
+		self._log_installer_phase_stop()
+		return 0
+
+	"""
+	Helper that upgrades all V2 VPSAs of cloud
+	"""
+	def vsa_upgrade_all(self, settings, opts, vc_image):
+		rc, upgradeable_vsas, error_vsas = self._check_all_vpsas_are_normal(settings, '[VPSAs Upgrade Check]', blocking_wait=True)
+		if rc != 0:
+			return rc
+
+		if len(error_vsas):
+			log(LOG_LEVEL_ERROR, 'ERROR: Please correct errors with VPSAs before upgrade! Error VPSAs = %s' % [v['name'] for v in error_vsas], console=True)
+			return -1
+
+		for vsa in upgradeable_vsas:
+			action_id='action_%d' % random.randint(200000, 300000)
+			rc = self._upgrade_one_vsa(settings, vsa, vc_image, action_id)
+			if rc != 0:
+				return rc
+		return 0
+
+	def _upgrade_ccvm_to_image(self, settings, images):
+		self._log_installer_phase_start('Upgrading CCVM to [%s]' % images['ccvm'])
+
+		cmd = [ZINSTALL, '--action', INT_REQ_SETUP_CCVM, '--image_name', images['ccvm']]
+		rc, out, err, sn_ip = self._run_on_active_cc(settings, cmd, 'Upgrading CCVM', ssh_print_stdout=True)
+		if rc != 0:
+			log(LOG_LEVEL_ERROR, 'ERROR: Failed to setup CCVM on [%s]' % sn_ip, console=True)
+			return rc
+
+		self._log_installer_phase_stop()
+		return 0
+
+	def _parse_cloud_upgrade_args_for_components_to_upgrade(self, opts):
+		# if user didnt specify explict option, allow all
+		if not opts.sns and not opts.vpsas and not opts.ccvm:
+			return 0, 'Enabled', 'Enabled', 'Enabled'
+
+		if opts.sns:
+			if opts.vpsas or opts.ccvm:
+				log(LOG_LEVEL_ERROR, 'ERROR: Options [--sns|--vpsas|--ccvm] are mutually exclusive!', console=True)
+				return -1, None, None, None
+			return 0, 'Enabled', 'Disabled', 'Disabled' # sn upgrade allowed
+		elif opts.vpsas:
+			if opts.sns or opts.ccvm:
+				log(LOG_LEVEL_ERROR, 'ERROR: Options [--sns|--vpsas|--ccvm] are mutually exclusive!', console=True)
+				return -1, None, None, None
+			return 0, 'Disabled', 'Enabled', 'Disabled' # vpsas upgrade allowed
+		elif opts.ccvm:
+			if opts.sns or opts.vpsas:
+				log(LOG_LEVEL_ERROR, 'ERROR: Options [--sns|--vpsas|--ccvm] are mutually exclusive!', console=True)
+				return -1, None, None, None
+			return 0, 'Disabled', 'Disabled', 'Enabled' # ccvm upgrade allowed
+
+	# returns default app engine resources needed 
+	def _get_default_app_engine_resources(self):
+		rc, msg = local_execute_cmd('%s -r print_app_engine_resources 2>/dev/null' % ZADARA_INSTALL_SH)
+		out = msg.split(':') # name, cpu, ram
+		return int(out[1]), int(out[2]) # cpu/ram
+
+	def _get_cpu_memory_for_instance_type(self, flavors, inst_type):
+		for flavor in flavors:
+			if flavor['name'] == inst_type:
+				return int(flavor['vcpus']), int(flavor['ram'])
+		return 0, 0
+
+	def _get_sn_cpu_memory_overprovision_status(self, settings):
+		cpu_overprovisioned_sns = []
+		memory_overprovisioned_sns = []
+		allow_cpu_overprovision = True if (settings.get('DISABLE_VCPU_PINNING', None) != None) else False
+		app_engine_cpus, app_engine_memory = self._get_default_app_engine_resources()
+
+		# get list of flavors
+		self._load_az_access_modules(settings)
+		flavors_url = self.az_access._get_tenant_url(0) + '/flavors/detail'
+		msg = self.az_access._expiration_proof_get(flavors_url)
+		flavors = json.loads(msg)['flavors']
+
+		self._log_installer_phase_start('Checking if any SN has CPU/Memory overprovisioned before upgrade')
+		for sn_uname in self._get_all_sn_unames(settings):
+			is_overprovisioned = False
+
+			role = self._get_role_for_sn(settings, sn_uname)
+			host_inventory_url = self.az_access._get_tenant_url(0) + '/inventory/%s' % sn_uname
+
+			#. Get host cpus
+			msg = self.az_access._expiration_proof_get(host_inventory_url)
+			inventory = json.loads(msg)
+			if sn_uname not in inventory or 'resources' not in inventory[sn_uname]:
+				self._log_installer_sub_phase_start('Checking Instances of SN[%s]' % sn_uname)
+				self._log_installer_sub_phase_stop('Cannot get /resources for SN. Ignoring SN overprovision check!')
+				continue
+
+			instances_summary = inventory[sn_uname]['instances_summary']
+			host_resources = inventory[sn_uname]['resources']
+			host_cpus = int(host_resources['vcpus'])
+			host_memory = int(host_resources['memory_mb'])
+			reserved_memory = int(instances_summary['reserved_memory_mb'])
+
+			# Subtract reserved cores for the host
+			cpu_info = json.loads(host_resources['cpu_info'])
+			reserved_cpus = (int(settings['RESERVED_NUMBER_OF_CORES_FOR_HOST']) * int(cpu_info['topology']['threads']))
+
+			#. If sn role is ccmaster/ccslave, get ccslave details and check
+			#. if the current SN is ccslave. We need to reserve ccvm resources on ccslave.
+			#. On ccmaster, ccvm resources are accounted in instances.
+
+			ccslave_reserved_cpu = 0
+			ccslave_reserved_memory = 0
+			if role in ['ccmaster', 'ccslave']:
+				cmd = ['/var/lib/zadara/scripts/sn/ha/get-ccslave-details']
+				rc, out, err, sn_ip = self._run_on_active_cc(settings, cmd, 'Getting ccslave details')
+				if rc != 0:
+					return rc, err
+
+				(ccslave_sn_name, ccvm_inst_type) = out.split()
+				if sn_uname == ccslave_sn_name:
+					#Get ccvm vcpus
+					ccslave_reserved_cpu, ccslave_reserved_memory = self._get_cpu_memory_for_instance_type(flavors, ccvm_inst_type)
+					ccslave_reserved_memory += (int(settings['RESERVED_EXTRA_MEMORY_PER_VM_MB']))
+				# check the current running version of nova and see if it is prior to 
+				# inventory changes. This we will know by checking for occupied_pcpu
+				# field in instances_summary dict. If it is present then nova is already
+				# running changed inventory code where memory resources are reported after
+				# accounting for all reserved memories. If it is not present, we need
+				# account for all reserved memories here.
+				if instances_summary.get('occupied_pcpu') is None:
+					reserved_memory += (int(settings['RESERVED_EXTRA_MEMORY_PER_HOST_MB']) + ccslave_reserved_memory)
+					host_memory += int(settings['RESERVED_EXTRA_MEMORY_PER_HOST_MB'])
+				reserved_cpus += ccslave_reserved_cpu
+
+			total_host_memory = host_memory
+			if instances_summary.get('occupied_pcpu') is not None:
+				total_host_memory += reserved_memory
+			self._log_installer_sub_phase_start('Checking Instances of SN: %s[Total: %dcpus/%dmb Reserved: %dcpus/%dmb]' % (sn_uname, host_cpus, total_host_memory, reserved_cpus, reserved_memory))
+			if instances_summary.get('occupied_pcpu') is None:
+				host_memory -= reserved_memory
+			host_cpus -= reserved_cpus
+
+			# Subtract all instance vcpus/memory
+			msg = self.az_access._expiration_proof_get(host_inventory_url + '/instances')
+			instances = json.loads(msg)[sn_uname]['instances']
+			needed_cpus=0
+			needed_memory=0
+			for i in instances:
+				inst_cpus = int(i['vcpus'])
+				inst_memory = int(i['memory_mb'])
+				inst_type_cpus, inst_type_memory = self._get_cpu_memory_for_instance_type(flavors, i['instance_type'])
+				# if instance already has more cpus/memory than the model says, then app-engine has been factored in
+				# otherwise factor it in
+				app_engine_str=''
+				if i['vsa_id'] and 'zios' not in i['instance_type'] and (inst_cpus == inst_type_cpus) and (inst_memory == inst_type_memory):
+					inst_cpus += app_engine_cpus
+					inst_memory += app_engine_memory
+					app_engine_str='(Resources for App Engine [cpus:%d/memory:%dmb] included)' % (app_engine_cpus, app_engine_memory)
+
+				# In old scheme of reporting inventory, per vm reserved mem is part
+				# of reserved_memory. So we should not count it here. Only for
+				# new inventory we add it as part of instance mem.
+				if instances_summary.get('occupied_pcpu') is not None:
+					inst_memory += int(settings['RESERVED_EXTRA_MEMORY_PER_VM_MB']) # add for extra reserved memory per instance
+				log(LOG_LEVEL_INFO, '\t- %s CPU:%d RAM:%dmb %s' % (i['name'], inst_cpus, inst_memory, app_engine_str), console=True)
+
+				needed_cpus += inst_cpus
+				needed_memory += inst_memory
+				host_cpus -= inst_cpus
+				host_memory -= inst_memory
+				if is_overprovisioned:
+					continue
+
+				if (host_cpus < 0):
+					is_overprovisioned = True
+					if not allow_cpu_overprovision:
+						cpu_overprovisioned_sns.append(sn_uname)
+
+				if (host_memory < 0):
+					memory_overprovisioned_sns.append(sn_uname)
+					is_overprovisioned = True
+
+			if is_overprovisioned:
+				if allow_cpu_overprovision:
+					self._log_installer_sub_phase_stop('SN %s has overprovisioned CPUs/memory (needs - CPU:%d/memory:%dmb). Ignoring as cpu overprovisioning is allowed - ALLOWS upgrade!' % (sn_uname, needed_cpus, needed_memory))
+				else:
+					self._log_installer_sub_phase_stop('SN %s has overprovisioned CPUs/memory (needs - CPU:%d/memory:%dmb) - DOESNT ALLOW upgrade!' % (sn_uname, needed_cpus, needed_memory))
+			else:
+				self._log_installer_sub_phase_stop('SN %s has free cpus[%d]/memory[%dmb]. Not overprovisioned - ALLOWS upgrade!' % (sn_uname, host_cpus, host_memory))
+
+		self._log_installer_phase_stop()
+
+		return cpu_overprovisioned_sns, memory_overprovisioned_sns
+
+	"""
+	Upgrade an entire cloud with a specified package
+	Phase-1: In this phase we upgrade the installer & switch to new version of zinstall to run the rest of cloud-upgrade
+	"""
+	def _ext_cloud_upgrade_phase1(self, opts, settings):
+		if not opts.pkg:
+			log(LOG_LEVEL_ERROR, 'ERROR: It is mandatory to specify package version for %s!' % opts.action, console=True)
+			return -1, 'Package not specified!'
+
+		if not os.path.exists(VPSA_REQUESTS_PY):
+			log(LOG_LEVEL_ERROR, "ERROR: Cannot locate [%s]. Bad state to proceed with cloud-upgrade!" % VPSA_REQUESTS_PY, console=True)
+			return -1, 'Wrong state to execute cloud_upgrade! Contact Zadara Support!'
+
+		rc, sns_upgrade_allowed, vsas_upgrade_allowed, ccvm_upgrade_allowed = self._parse_cloud_upgrade_args_for_components_to_upgrade(opts)
+		if rc != 0:
+			return rc, 'Invalid arguments for cloud_upgrade!'
+
+		log(LOG_LEVEL_INFO, "INFO: Performing Cloud Upgrade with [SNs Upgrade:%s]/[VSAs Upgrade:%s]/[CCVM Upgrade:%s]!" % (sns_upgrade_allowed, vsas_upgrade_allowed, ccvm_upgrade_allowed), console=True)
+
+		pkg_coords = self._do_package_validation_checks_and_get_coords(opts, settings)
+		if not pkg_coords:
+			return -1, 'Cannot find fully downloaded package[%s]!' % opts.pkg
+
+		# Check connection/software status on all SNs before continuing further
+		self._log_installer_phase_start('Basic validations of SNs in Cloud')
+		all_sn_status, connected_sns, not_connected_sns, not_installed_sns = self._get_all_sn_status(settings)
+		if len(not_connected_sns):
+			log(LOG_LEVEL_ERROR, 'ERROR: Detected SNs that are not connected %s. Cant continue with cloud_upgrade!' % not_connected_sns, console=True)
+			return -1, 'SNs [%s] are not connected. Cannot perform cloud_upgrade!' % not_connected_sns
+
+		if len(not_installed_sns):
+			log(LOG_LEVEL_ERROR, 'ERROR: Detected SNs that are not installed %s. Cant continue with cloud_upgrade!' % not_installed_sns, console=True)
+			return -1, 'SNs [%s] are not installed. Cannot perform cloud_upgrade!' % not_installed_sns
+
+
+		self._log_installer_phase_stop('Done - [%d] SNs connected & ready for upgrade!' % len(all_sn_status))
+
+		# Now that we verified all SNs are alright, disable any timeout handling to be more resilient
+		self.timeout_disable = True
+
+		images = self._get_image_name_from_pkg_coords(pkg_coords, ['zadara-installer'])
+
+		# if we have a new installer, upgrade on all SNs of cloud as the first step
+		if 'zadara-installer' in images:
+			success_sns, failed_sns, not_connected_sns = self._cloud_install_pkgs(settings, pkg_coords['ccmaster_ip'],
+					os.path.join(pkg_coords['pkg_repo'], pkg_coords['pkg'], images['zadara-installer']), '[Upgrading Installer - %s ]' % images['zadara-installer'])
+
+			if len(not_connected_sns) or len(failed_sns):
+				log(LOG_LEVEL_ERROR, 'ERROR: Failed to upgrade zadara-installer on %s. Cant continue with cloud_upgrade!' % (not_connected_sns + failed_sns), console=True)
+				return -1, 'Failed to upgrade Installer package on SNs! Contact Zadara Support!'
+
+		# Run same zinstall with exact invocation, but with upgrade_phase of 2 instead of the default upgrade_phase==1
+		cmd = sys.argv + ['--upgrade_phase', '2', '--installer_logging_phase', str(self.get_installer_phase())]
+		rc, out, err = execute_cmd_by_subprocess(cmd, print_stdout=True)
+		return rc, err
+
+	"""
+	Upgrade an entire cloud with a specified package
+	Phase-2: This is the actual phase where we do the upgrade of components specified
+	"""
+	def _ext_cloud_upgrade_phase2(self, opts, settings):
+		# continue from where phase-1 left
+		if opts.installer_logging_phase:
+			self.set_installer_phase(int(opts.installer_logging_phase))
+
+		#. Check if SN CPUs are overprovisioned. If yes, abort the upgrade
+		cpu_overprovisioned_sns, memory_overprovisioned_sns = self._get_sn_cpu_memory_overprovision_status(settings)
+		if len(cpu_overprovisioned_sns) or len(memory_overprovisioned_sns):
+			log(LOG_LEVEL_ERROR, 'ERROR: Detected CPU overprovisioned SNs [%s]/Memory overprovisioned SNs [%s]. Cant continue with cloud_upgrade!' % (cpu_overprovisioned_sns, memory_overprovisioned_sns), console=True)
+			return -1, 'SNs [%s] have CPU overprovisioned/[%s] have memory overprovisioned. Cannot perform cloud_upgrade!' % (cpu_overprovisioned_sns, memory_overprovisioned_sns)
+
+		# since we did all the checks in phase-1 itself, phase-2, there are no validations required
+		self.timeout_disable = True
+		rc, sns_upgrade_allowed, vsas_upgrade_allowed, ccvm_upgrade_allowed = self._parse_cloud_upgrade_args_for_components_to_upgrade(opts)
+		pkg_coords = self._do_package_validation_checks_and_get_coords(opts, settings)
+		images = self._get_image_name_from_pkg_coords(pkg_coords, ['ccvm', 'vc'])
+
+		if not opts.skip_vsa_checks:
+			rc, upgradeable_vsas, error_vsas = self._check_all_vpsas_are_normal(settings, '[Upgrade pre-check]', blocking_wait=False)
+			if rc != 0:
+				return rc, 'VPSAs are not in upgradeable state!'
+
+			# If there are errored VPSA's, dont allow upgrade!
+			if len(error_vsas):
+				log(LOG_LEVEL_ERROR, 'ERROR: Please correct errors with VPSAs before upgrade! Error VPSAs = %s' % [v['name'] for v in error_vsas], console=True)
+				return -1, 'Some VPSAs are in error state! Cant perform cloud_upgrade!'
+
+		if sns_upgrade_allowed == 'Enabled':
+			rc = self.sn_upgrade_all(settings, opts)
+			if rc != 0:
+				return rc, 'Failed to upgrade all SNs of cloud! Contact Zadara Support!'
+
+		if ccvm_upgrade_allowed == 'Enabled':
+			if 'ccvm' in images:
+				# Now that we upgraded all SNs, upgrade CCVM
+				rc = self._upgrade_ccvm_to_image(settings, images)
+				if rc != 0:
+					return rc, 'Failed to upgrade CCVM! Contact Zadara Support!'
+			else:
+				log(LOG_LEVEL_INFO, "INFO: No CCVM image available in Package[%s]. Not setting up CCVM!" % opts.pkg, console=True)
+
+		if vsas_upgrade_allowed == 'Enabled':
+			if 'vc' in images:
+				rc = self.vsa_upgrade_all(settings, opts, images['vc'])
+				if rc != 0:
+					return rc, 'Failed to upgrade VPSAs of cloud! Contact Zadara Support!'
+			else:
+				log(LOG_LEVEL_INFO, "INFO: No VC image available in Package[%s]. Not upgrading VPSAs!" % opts.pkg, console=True)
+
+		return 0, 'Cloud upgrade completed successfully!'
+
+	"""
+	Wrapper over _ext_cloud_upgrade
+	"""
+	def ext_cloud_upgrade(self, opts):
+		settings = self.load_settings()
+
+		# we run cloud_upgrade in 2 phases. The first phase is the user invocation & it does the minimum
+		# things of checking args & upgrades installer package on all SNs of cloud
+		# Once we finish this, we invoke the newly installed zinstalls phase-2 so that new logics
+		# in cloud-upgrade orchestration are taken into account
+		if opts.upgrade_phase == 1:
+			rc, statusmsg = self._ext_cloud_upgrade_phase1(opts, settings)
+
+			# Create cloud-upgrade completion ticket
+			status = 'Success' if rc == 0 else 'Failed'
+			self._create_cloud_upgrade_complete_ticket(settings['ENVIRONMENT_NAME'], opts.pkg, status, statusmsg)
+		elif opts.upgrade_phase == 2:
+			rc, statusmsg = self._ext_cloud_upgrade_phase2(opts, settings)
+			if statusmsg:
+				sys.stderr.write(statusmsg)
+		else:
+			log(LOG_LEVEL_ERROR, "Critical Error! Bad Invocation!", console=True)
+			sys.exit(1)
+
+		return rc
+
+	"""
+	dumps all networking info of this node in json format
+	"""
+	def dump_node_network_info(self, opts):
+		# ensure vlan driver is loaded
+		local_execute_cmd('modprobe 8021q')
+
+		# On a fresh OS install, the needed networking drivers like mlx4_en may
+		# not be loaded by default.
+		# So probe them here, otherwise, the needed network interfaces may not show up at this point
+		net_drivers=('ixgbe', 'mlx4_core', 'mlx4_en', 'mlx4_ib')
+		for net_driver in net_drivers:
+			local_execute_cmd('modprobe %s' % net_driver)
+
+		# get all underlying interfaces & if they have direct IP association
+		skip_vf_drivers=['ixgbevf']
+		interfaces=[]
+		for intf in os.listdir('/sys/class/net'):
+			if not os.path.exists('/sys/class/net/%s/device' % intf):
+				continue
+
+			driver=os.readlink('/sys/class/net/%s/device/driver' % intf).split("/")[-1]
+			if driver in skip_vf_drivers:
+				continue
+
+			# Some network cards use the same driver both for VFs and for PFs
+			# For such drivers, let's check that this interface is not a VF
+			if os.path.islink('/sys/class/net/%s/device/physfn' % intf):
+				continue
+
+			interface={}
+			interface['intf']=intf
+			interface['driver']=driver
+
+			# capture if any IP is available
+			rc, msg = local_execute_cmd('ip addr show dev %s' % intf)
+			for line in msg.split("\n"):
+				if 'inet' in line and 'inet6' not in line:
+					ip=line.split()[1]
+					interface['ip']=ip.split("/")[0]
+					interface['cidr']=ip.split("/")[-1]
+					interface['brd']=line.split()[3]
+			interfaces.append(interface)
+
+		# get all assigned IPs on the SN
+		assigned_ips={}
+		rc, msg = local_execute_cmd('ip addr show|grep -w inet')
+		for line in msg.split("\n"):
+			intf=line.split("scope")[-1].strip().split()[-1]
+			if intf == 'lo':
+				continue
+			assigned_ips[line.split()[1]] = intf
+		print json.dumps({'interfaces':interfaces, 'assigned_ips':assigned_ips})
+		return 0
+
+	"""
+	dumps DRBD partition info
+	"""
+	def int_dump_drbd_part_info(self, opts):
+		rootdev = 'sda1' #default
+		drbddev = 'sda6' #default
+
+		# first check which device the root disk is mouted on
+		f = open("/proc/mounts")
+		for line in f.readlines():
+			mount = line.strip().split()
+			if mount[1] == '/' and mount[0] != 'rootfs':
+				if mount[0].startswith('/dev/disk'):
+					rootdev = os.readlink(mount[0]).split('/')[-1]
+				elif mount[0].startswith('/dev/sd'):
+					rootdev = mount[0].split('/')[-1]
+				if rootdev.startswith('dm-'):
+					rc, msg = local_execute_cmd('ls -l /dev/disk/by-id|grep -w %s|head -1'% rootdev)
+					rootdev = msg.strip().split('->')[0].split()[-1]
+				drbddev  = '%s6' % re.split(r'(\d+)$', rootdev)[0]
+				break
+		f.close()
+
+		# now try to see if we can use this drbddev
+
+		# pickup wwn device name for the dev
+		rc, msg = local_execute_cmd('ls -l /dev/disk/by-id|grep -w %s'% drbddev)
+		drbd_part = None
+		for line in msg.split("\n"):
+			if not line:
+				continue
+			part = line.split()[-3]
+			drbd_part = part if drbd_part == None or part.startswith('wwn') else drbd_part
+		if not drbd_part:
+			log(LOG_LEVEL_ERROR, "ERROR: Cannot find by-id resolution for /dev/%s (%s)" % (drbddev, msg))
+			return -1
+		drbd_part = '/dev/disk/by-id/%s' % drbd_part
+		rc, msg = local_execute_cmd('blockdev --getsize64 %s' % drbd_part)
+		drbd_part_size = int(msg.strip())
+
+		# check fstab doesnt have an entry with this device
+		f = open('/etc/fstab', 'r')
+		fstab = f.read()
+		f.close()
+		for line in fstab.split("\n"):
+			if line.startswith('#') or 'UUID' not in line:
+				continue
+			dev='/dev/disk/by-uuid/%s' % line.split()[0].split('=')[-1]
+			use=line.split()[2]
+			dev = '/dev/%s' % os.readlink(dev).split("/")[-1]
+			if dev == '/dev/%s' % drbddev:
+				log(LOG_LEVEL_ERROR, 'ERROR: %s (%s) is in use. Cant be used for DRBD!' % (dev, use))
+				return -1
+
+		# we are ready to dump this part info
+		print json.dumps({'drbd_part': drbd_part, 'size' : drbd_part_size})
+		return 0
+
+	"""
+	Helper to setup DRBD settings on SN
+	"""
+	def _create_drbd_settings_on_sn(self, settings, sn):
+		self._log_installer_sub_phase_start('Creating DRBD Settings on SN[%s]' % sn['uname'])
+		rc, out, err = self.ssh_execute(sn['ip'], [ZINSTALL, '--action', INT_REQ_CREATE_DRBD_SETTINGS], print_stdout=True)
+		if rc != 0:
+			log(LOG_LEVEL_ERROR, 'ERROR: Failed to create DRBD settings on[%s]!' % sn['uname'], console=True)
+			return -1
+		self._log_installer_sub_phase_stop()
+		return 0
+
+
+	"""
+	Create DRBD Settings file on SN
+	"""
+	def int_create_drbd_settings(self, opts):
+		settings = self.load_settings()
+		if 'DRBD_CCMASTER_DISK' in settings:
+			log(LOG_LEVEL_INFO, '\t- DRBD settings already present in settings file. Not creating!', console=True)
+			return 0
+
+		cmd=[ZINSTALL, '--action', INT_REQ_DUMP_DRBD_PART_INFO]
+		drbd_partitions={}
+		for role in ['ccmaster', 'ccslave']:
+			sn_uname = self._get_sn_uname_by_role(settings, role)
+			fe_ip, be_ip, mgmt_ip, extmgmt_ip = self._get_ip_for_sn(settings, sn_uname)
+			status, nova_version, sn_version, installer_version = self._get_sn_status(sn_uname, extmgmt_ip)
+			if status != 'connected':
+				log(LOG_LEVEL_ERROR, '\t- SN [%s/%s] is not connected! Cannot create DRBD settings'% (sn_uname, role), console=True)
+				return -1
+
+			log(LOG_LEVEL_INFO, '\t- Getting DRBD partition information on SN [%s]' % sn_uname, console=True)
+			rc, out, err = self.ssh_execute(extmgmt_ip, cmd)
+			if rc != 0:
+				log(LOG_LEVEL_ERROR, '\t- Failed to get DRBD partition information on SN [%s]' % sn_uname, console=True)
+				return -1
+			drbd_partitions[role]=json.loads(out.strip())
+
+		if drbd_partitions['ccmaster']['size'] < (DRBD_MIN_PART_SIZE):
+			log(LOG_LEVEL_ERROR, "ERROR: DRBD Partition Size ccmaster[%s]/[size:%dGB] < recommended-minimum(%dGB)" % \
+				(drbd_partitions['ccmaster']['drbd_part'], drbd_partitions['ccmaster']['size']/ONE_GB, DRBD_MIN_PART_SIZE/ONE_GB), console=True)
+			return -1
+
+		if drbd_partitions['ccslave']['size'] != drbd_partitions['ccmaster']['size']:
+			log(LOG_LEVEL_ERROR, "ERROR: DRBD Partition Size mismatch between ccmaster[%s]/[size:%d] & ccslave[%s]/[size:%d]" % \
+						(drbd_partitions['ccmaster']['drbd_part'], drbd_partitions['ccmaster']['size'], \
+						drbd_partitions['ccslave']['drbd_part'], drbd_partitions['ccslave']['size']), console=True)
+			return -1
+
+		f = open(DRBD_SETTINGS_FILE, 'w')
+		f.write('DRBD_CCMASTER_DISK=%s\n' % drbd_partitions['ccmaster']['drbd_part'])
+		f.write('DRBD_CCSLAVE_DISK=%s\n' % drbd_partitions['ccslave']['drbd_part'])
+		f.close()
+		return 0
+
+# signal handlers to know what signals we are getting
+SIGNAL_NAMES = dict((k, v) for v, k in signal.__dict__.iteritems() if v.startswith('SIG'))
+def signal_handler(signum, frame):
+	#log(LOG_LEVEL_INFO, 'zinstall - Received signal[%s]' % SIGNAL_NAMES[signum])
+	pass
+
+def register_all_signal_handlers():
+	uncatchable = ['SIG_DFL','SIGSTOP','SIGKILL']
+	for i in [x for x in dir(signal) if x.startswith("SIG")]:
+		if not i in uncatchable:
+			signum = getattr(signal,i)
+			signal.signal(signum, signal_handler)
+
+if __name__ == '__main__':
+	if os.geteuid() != 0:
+		print >> sys.stderr, 'ERROR: You need to execute this script with sudo!'
+		sys.exit(1)
+
+	cmnd = ''
+	for arg in sys.argv:
+        	cmnd += ' ' + arg
+	log(LOG_LEVEL_INFO, 'Invoked as: %s' % cmnd)
+
+	parser = optparse.OptionParser(add_help_option=False, usage="usage: %prog --opt1 <opt1> --opt2 <opt2> ..", description='zinstall')
+
+	# external args
+	parser.add_option('--action', help='Action to be executed')
+	parser.add_option('--sn_uname', help='comma seperated sn-unames')
+	parser.add_option('--remote_repo', help='remote location of pkgs to download from')
+	parser.add_option('--pkg', help='package version')
+	parser.add_option('--pkg_path', help='list of package paths')
+	parser.add_option('--help', action="store_true")
+	parser.add_option('--skip_vsa_checks', action="store_true")
+	parser.add_option('--param', help='used in conjunction with set config')
+	parser.add_option('--value', help='used in conjunction with set config')
+	parser.add_option('--sns', action="store_true", help='used in conjunction with cloud_upgrade')
+	parser.add_option('--vpsas', action="store_true", help='used in conjunction with cloud_upgrade')
+	parser.add_option('--ccvm', action="store_true", help='used in conjunction with cloud_upgrade')
+
+	# internal args
+	parser.add_option('--intf', help='used in conjunction with [un]assign_ip_on_intf')
+	parser.add_option('--ip', help='used in conjunction with [un]assign_ip_on_intf')
+	parser.add_option('--vlan', help='used in conjunction with [un]assign_ip_on_intf')
+	parser.add_option('--pingip', help='used in conjunction with [un]assign_ip_on_intf')
+	parser.add_option('--unassign_after_ping', action="store_true", help='used in conjunction with assign_ip_on_intf')
+	parser.add_option('--source_intf', help='used in conjunction with rename_network_intf')
+	parser.add_option('--target_intf', help='used in conjunction with rename_network_intf')
+	parser.add_option('--reason', help='used in conjunction with rename_network_intf')
+	parser.add_option('--local_package_list', action="store_true", help='used in conjunction with get_package_details')
+	parser.add_option('--staging_source', help='used in conjunction with int_stage_pkg_for_install')
+	parser.add_option('--checkpoint_input', help='used in conjunction with int_update_checkpoint')
+	parser.add_option('--image_name', help='used in conjunction with int_setup_ccvm')
+	parser.add_option('--ticket_msgid', help='used in conjunction with int_create_support_ticket')
+	parser.add_option('--ticket_args', help='used in conjunction with int_create_support_ticket')
+	parser.add_option('--ticket_priority', default='TICKET_PRIORITY_LOW', help='used in conjunction with int_create_support_ticket')
+	parser.add_option('--json', action="store_true", help='output in json')
+	parser.add_option('--upgrade_phase', type='int', default=1, help='used in conjunction with cloud_upgrade')
+	parser.add_option('--installer_logging_phase', type='int', help='used in conjunction with cloud_upgrade')
+
+	opts, args = parser.parse_args()
+
+	if opts.help:
+		print_usage_and_die('zinstall')
+
+	zinstall_logging.console_allowed = False if opts.json else True
+	register_all_signal_handlers()
+	zinstall_mgr = ZInstallManager()
+	if opts.action == EXT_REQ_CC_INSTALL:
+		rc=zinstall_mgr.ext_cc_install(opts)
+	elif opts.action == EXT_REQ_SN_INSTALL:
+		rc=zinstall_mgr.ext_sn_install(opts)
+	elif opts.action == EXT_REQ_SN_UPGRADE:
+		rc=zinstall_mgr.ext_sn_upgrade(opts)
+	elif opts.action == EXT_REQ_CHECK_NETWORKING:
+		rc=zinstall_mgr.ext_check_networking(opts)
+	elif opts.action == EXT_REQ_LIST_SNS:
+		rc=zinstall_mgr.ext_list_sns(opts)
+	elif opts.action == EXT_REQ_LIST_PKGS:
+		rc=zinstall_mgr.ext_list_pkgs(opts)
+	elif opts.action == EXT_REQ_DOWNLOAD_PKG:
+		rc=zinstall_mgr.ext_download_pkg(opts)
+	elif opts.action == EXT_REQ_ERASE_PKG:
+		rc=zinstall_mgr.ext_erase_pkg(opts)
+	elif opts.action == EXT_REQ_CLOUD_INSTALL_PKG:
+		rc=zinstall_mgr.ext_cloud_install_pkg(opts)
+	elif opts.action == EXT_REQ_CLOUD_UPGRADE:
+		rc=zinstall_mgr.ext_cloud_upgrade(opts)
+	elif opts.action == EXT_REQ_REGISTER_IMGS_IN_GLANCE:
+		rc=zinstall_mgr.ext_register_images_in_glance(opts)
+	elif opts.action == EXT_REQ_SHOW_CONFIG:
+		rc=zinstall_mgr.ext_show_config(opts)
+	elif opts.action == EXT_REQ_SET_CONFIG:
+		rc=zinstall_mgr.ext_set_config(opts)
+	elif opts.action == INT_REQ_DUMP_NODE_NETWORK_INFO:
+		rc=zinstall_mgr.dump_node_network_info(opts)
+	elif opts.action == INT_REQ_ASSIGN_IP_ON_INTF:
+		rc=zinstall_mgr.assign_ip_on_intf(opts)
+	elif opts.action == INT_REQ_UNASSIGN_IP_ON_INTF:
+		rc=zinstall_mgr.unassign_ip_on_intf(opts)
+	elif opts.action == INT_REQ_PING_IP_ON_INTF:
+		rc=zinstall_mgr.ping_ip_on_intf(opts)
+	elif opts.action == INT_REQ_RENAME_NETWORK_INTF:
+		rc=zinstall_mgr.rename_network_intf(opts)
+	elif opts.action == INT_REQ_GET_PACKAGE_DETAILS:
+		rc=zinstall_mgr.get_package_details(opts)
+	elif opts.action == INT_REQ_DOWNLOAD_PKG:
+		rc=zinstall_mgr.int_download_pkg(opts)
+	elif opts.action == INT_REQ_ERASE_PKG:
+		rc=zinstall_mgr.int_erase_pkg(opts)
+	elif opts.action == INT_REQ_STAGE_PKG_FOR_INSTALL:
+		rc=zinstall_mgr.int_stage_pkg_for_install(opts)
+	elif opts.action == INT_REQ_DESTAGE_PKG_AFTER_INSTALL:
+		rc=zinstall_mgr.int_destage_pkg_after_install(opts)
+	elif opts.action == INT_REQ_LOAD_CHECKPOINT:
+		rc=zinstall_mgr.int_load_checkpoint(opts)
+	elif opts.action == INT_REQ_UPDATE_CHECKPOINT:
+		rc=zinstall_mgr.int_update_checkpoint(opts)
+	elif opts.action == INT_REQ_SWITCHOVER_REPO_DIR:
+		rc=zinstall_mgr.int_switchover_repo(opts)
+	elif opts.action == INT_REQ_REGISTER_IMGS_IN_GLANCE:
+		rc=zinstall_mgr.int_register_imgs_in_glance(opts)
+	elif opts.action == INT_REQ_SETUP_CCVM:
+		rc=zinstall_mgr.int_setup_ccvm(opts)
+	elif opts.action == INT_REQ_GET_DRBD_STATE:
+		rc=zinstall_mgr.int_get_drbd_state(opts)
+	elif opts.action == INT_REQ_INSTALL_REMOTE_PKGS:
+		rc=zinstall_mgr.int_install_remote_pkgs(opts)
+	elif opts.action == INT_REQ_TRIGGER_CC_FAILOVER:
+		rc=zinstall_mgr.int_trigger_cc_failover(opts)
+	elif opts.action == INT_REQ_CONTINUE_CC_FAILOVER:
+		rc=zinstall_mgr.int_continue_cc_failover(opts)
+	elif opts.action == INT_REQ_GET_CONFIG:
+		rc=zinstall_mgr.int_get_config(opts)
+	elif opts.action == INT_REQ_ENSURE_VLAN_PKG:
+		rc=zinstall_mgr.int_ensure_vlan_pkg(opts)
+	elif opts.action == INT_REQ_CREATE_SUPPORT_TICKET:
+		rc=zinstall_mgr.int_create_support_ticket(opts)
+	elif opts.action == INT_REQ_DUMP_DRBD_PART_INFO:
+		rc=zinstall_mgr.int_dump_drbd_part_info(opts)
+	elif opts.action == INT_REQ_CREATE_DRBD_SETTINGS:
+		rc=zinstall_mgr.int_create_drbd_settings(opts)
+	elif opts.action == INT_REQ_SET_CONFIG:
+		rc=zinstall_mgr.int_set_config(opts)
+	elif opts.action == INT_REQ_ENSURE_APT_SETUP_FOR_PROXY:
+		rc=zinstall_mgr.int_ensure_apt_setup_for_proxy(opts)
+	else:
+		msg = 'Invoked without any action specified' if not opts.action else ('Invoked with invalid action[%s]' % opts.action)
+		print >> sys.stderr, 'ERROR: %s! Valid actions[%s]\n' % (msg, VALID_USER_ACTIONS)
+		print_usage_and_die('zinstall')
+
+	log(LOG_LEVEL_INFO, 'Command[%s] exitting with rc[%d]' % (cmnd, rc))
+	sys.exit(rc)
